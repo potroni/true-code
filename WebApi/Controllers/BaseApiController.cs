@@ -14,4 +14,8 @@ public abstract class BaseApiController : ControllerBase
         : throw new InvalidOperationException("The authenticated user has no valid ID.");
 
     protected bool IsAdmin => User.IsInRole(AdminRole);
+
+    protected ObjectResult ConflictWithReason(string reason) =>
+        Problem(statusCode: StatusCodes.Status409Conflict,
+            extensions: new Dictionary<string, object?> { ["reason"] = reason });   //todo: think about separate service or fabric
 }
