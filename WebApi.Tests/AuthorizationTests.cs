@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text.Json;
 using DataAccessLayer.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Hosting;
@@ -65,6 +66,45 @@ public class AuthorizationTests
 
     private static void SetBearerToken(HttpClient client, string token) =>
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+    [TestMethod]
+    public async Task BusinessEndpointsShareSixtyRequestsPerUser()
+    {
+        using var factory = new AuthorizationApplicationFactory();
+        using var client = factory.CreateClient();
+        var tokenService = factory.Services.GetRequiredService<AccessTokenService>();
+        SetBearerToken(client, tokenService.Create(new User
+        {
+            Id = 1, Email = "first@club.test", Role = ApiAuthorization.AdminRole
+        }).AccessToken);
+
+        await Task.WhenAll(Enumerable.Range(0, 60).Select(index =>
+            AssertStatusAsync(client, index % 2 == 0 ? IdentityPath : AdminPath, HttpStatusCode.OK)));
+
+        SetBearerToken(client, tokenService.Create(new User
+        {
+            Id = 1, Email = "updated@club.test", Role = ApiAuthorization.AdminRole
+        }).AccessToken);
+        using var rejected = await client.GetAsync(AdminPath);
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+        Assert.AreEqual("application/problem+json", rejected.Content.Headers.ContentType?.MediaType);
+        var problem = await rejected.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(429, problem.GetProperty("status").GetInt32());
+        await AssertStatusAsync(client, IdentityPath, HttpStatusCode.TooManyRequests);
+
+        using var login = await client.PostAsJsonAsync("/auth/login",
+            new LoginRequest { Email = "user001@club.test", Password = "Password123!" });
+        Assert.AreEqual(HttpStatusCode.OK, login.StatusCode);
+
+        client.DefaultRequestHeaders.Authorization = null;
+        await AssertStatusAsync(client, IdentityPath, HttpStatusCode.Unauthorized);
+
+        SetBearerToken(client, tokenService.Create(new User
+        {
+            Id = 2, Email = "second@club.test", Role = "user"
+        }).AccessToken);
+        await AssertStatusAsync(client, IdentityPath, HttpStatusCode.OK);
+    }
 
     private static async Task AssertStatusAsync(HttpClient client, string path, HttpStatusCode expected)
     {
