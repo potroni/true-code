@@ -29,10 +29,12 @@ public class HttpContractTests
     [DataRow("class-seats", """{"classId":null,"seats":1}""")]
     [DataRow("class-seats", """{"classId":"0","seats":1}""")]
     [DataRow("class-seats", """{"classId":0,"seats":0}""")]
+    [DataRow("class-seats", """{"classId":9223372036854775808,"seats":1}""")]
     [DataRow("change-seats", "{}")]
     [DataRow("change-seats", null)]
     [DataRow("change-seats", """{"seats":"1"}""")]
     [DataRow("change-seats", """{"seats":0}""")]
+    [DataRow("change-seats", """{"seats":-1}""")]
     public async Task InvalidBodyReturnsProblemDetails(string endpoint, string? body)
     {
         using var factory = new ContractApplicationFactory();
@@ -95,12 +97,16 @@ public class HttpContractTests
     [DataRow("schedule?from=2026-09-22T10:00&to=2026-09-22T13:00&roomId=no")]
     [DataRow("schedule?from=2026-09-22T10:00&to=2026-09-22T12:00%2B02:00")]
     [DataRow("schedule?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=0")]
+    [DataRow("schedule?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=101")]
     [DataRow("load?from=2026-09-22T10:00&to=2026-09-22")]
     [DataRow("load?from=2026-9-22&to=2026-09-22")]
     [DataRow("load?from=2026-02-30&to=2026-09-22")]
     [DataRow("load?from=2026-09-22")]
+    [DataRow("load?to=2026-09-22")]
+    [DataRow("load?from=2026-09-22&to=2026-09-22&roomId=no")]
     [DataRow("load?from=2026-09-23&to=2026-09-22")]
     [DataRow("ids/no")]
+    [DataRow("ids/9223372036854775808")]
     public async Task InvalidQueryOrRouteValueReturnsProblemDetails(string endpoint)
     {
         using var factory = new ContractApplicationFactory();
@@ -108,6 +114,22 @@ public class HttpContractTests
         using var response = await client.GetAsync($"{Path}/{endpoint}");
 
         await ReadProblemAsync(response, HttpStatusCode.BadRequest);
+    }
+
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(100)]
+    public async Task ScheduleAcceptsBothPageSizeBoundariesAndNormalizesToAcrossMidnight(int limit)
+    {
+        using var factory = new ContractApplicationFactory();
+        using var client = CreateClient(factory);
+        using var response = await client.GetAsync(
+            $"{Path}/schedule?from=2026-09-22T20:00Z&to=2026-09-23T00:15%2B02:00&limit={limit}");
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual("2026-09-22T22:15:00Z", json.GetProperty("to").GetString());
+        Assert.AreEqual(limit, json.GetProperty("limit").GetInt32());
     }
 
     [TestMethod]

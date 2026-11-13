@@ -2,11 +2,13 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using DataAccessLayer;
 using DataAccessLayer.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Auth;
 using WebApi.Controllers;
@@ -51,17 +53,35 @@ public class AuthorizationTests
         var token = await login.Content.ReadFromJsonAsync<LoginResponse>();
         Assert.IsNotNull(token);
 
+        await using var scope = factory.Services.CreateAsyncScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ClubDbContext>();
+        var expectedUserId = await dbContext.Set<User>()
+            .Where(user => user.Email == email)
+            .Select(user => user.Id)
+            .SingleAsync();
+
         SetBearerToken(client, token.AccessToken);
 
         using var identity = await client.GetAsync(IdentityPath);
         Assert.AreEqual(HttpStatusCode.OK, identity.StatusCode);
         var userId = await identity.Content.ReadFromJsonAsync<long>();
-        Assert.IsTrue(userId > 0);
+        Assert.AreEqual(expectedUserId, userId);
         using var withQuery = await client.GetAsync($"{IdentityPath}?userId={userId + 1}");
         Assert.AreEqual(HttpStatusCode.OK, withQuery.StatusCode);
         Assert.AreEqual(userId, await withQuery.Content.ReadFromJsonAsync<long>());
 
         await AssertStatusAsync(client, AdminPath, adminStatus);
+    }
+
+    [TestMethod]
+    public async Task AnonymousLoginRejectsIncorrectPassword()
+    {
+        using var factory = new AuthorizationApplicationFactory();
+        using var client = factory.CreateClient();
+        using var login = await client.PostAsJsonAsync("/auth/login",
+            new LoginRequest { Email = "user001@club.test", Password = "incorrect-password" });
+
+        Assert.AreEqual(HttpStatusCode.Unauthorized, login.StatusCode);
     }
 
     private static void SetBearerToken(HttpClient client, string token) =>
