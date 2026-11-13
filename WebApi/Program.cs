@@ -59,9 +59,23 @@ builder.Services
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
             ClockSkew = TimeSpan.Zero
         };
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = context =>
+            {
+                if (!ApiAuthorization.TryGetUserId(context.Principal!, out _))
+                {
+                    context.Fail("The token must identify a user.");
+                }
+
+                return Task.CompletedTask;
+            }
+        };
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+    options.AddPolicy(ApiAuthorization.AdminPolicy, policy =>
+        policy.RequireAuthenticatedUser().RequireRole(ApiAuthorization.AdminRole)));
 
 var app = builder.Build();
 
