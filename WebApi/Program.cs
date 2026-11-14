@@ -25,6 +25,7 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
+builder.Services.AddSingleton(TimeProvider.System);
 
 builder.Services.AddDbContext<ClubDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
@@ -59,9 +60,23 @@ builder.Services
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
             ClockSkew = TimeSpan.Zero
         };
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = context =>
+            {
+                if (!ApiAuthorization.TryGetUserId(context.Principal!, out _))
+                {
+                    context.Fail("The token must identify a user.");
+                }
+
+                return Task.CompletedTask;
+            }
+        };
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+    options.AddPolicy(ApiAuthorization.AdminPolicy, policy =>
+        policy.RequireAuthenticatedUser().RequireRole(ApiAuthorization.AdminRole)));
 
 var app = builder.Build();
 
@@ -70,7 +85,9 @@ app.UseMiddleware<ExceptionHandlingMiddleware>();
 app.UseSwagger();
 app.UseSwaggerUI();
 
+app.UseRouting();
 app.UseAuthentication();
+app.UseMiddleware<BusinessRateLimitMiddleware>();
 app.UseAuthorization();
 
 app.MapControllers();
