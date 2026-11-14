@@ -25,11 +25,7 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
-builder.Services.AddRateLimiter(options =>
-{
-    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-    options.AddPolicy<string, BusinessRateLimitPolicy>(BusinessRateLimitPolicy.Name);
-});
+builder.Services.AddSingleton(TimeProvider.System);
 
 builder.Services.AddDbContext<ClubDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
@@ -91,7 +87,7 @@ app.UseSwaggerUI();
 
 app.UseRouting();
 app.UseAuthentication();
-app.UseRateLimiter();
+app.UseMiddleware<BusinessRateLimitMiddleware>();
 app.UseAuthorization();
 
 app.MapControllers();

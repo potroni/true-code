@@ -133,20 +133,65 @@ public class AuthorizationTests
         await AssertStatusAsync(client, IdentityPath, HttpStatusCode.OK);
     }
 
+    [TestMethod]
+    public async Task BusinessRequestsExpireIndividuallyAfterSixtySeconds()
+    {
+        var clock = new ManualTimeProvider();
+        using var factory = new AuthorizationApplicationFactory(clock);
+        using var client = factory.CreateClient();
+        var tokenService = factory.Services.GetRequiredService<AccessTokenService>();
+        SetBearerToken(client, tokenService.Create(new User
+        {
+            Id = 1, Email = "first@club.test", Role = ApiAuthorization.AdminRole
+        }).AccessToken);
+
+        await AssertStatusAsync(client, IdentityPath, HttpStatusCode.OK);
+        clock.Advance(TimeSpan.FromSeconds(59));
+        await Task.WhenAll(Enumerable.Range(0, 59).Select(_ =>
+            AssertStatusAsync(client, IdentityPath, HttpStatusCode.OK)));
+
+        clock.Advance(TimeSpan.FromMilliseconds(999));
+        using var rejected = await client.GetAsync(AdminPath);
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+        Assert.AreEqual(TimeSpan.FromSeconds(1), rejected.Headers.RetryAfter?.Delta);
+
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        await AssertStatusAsync(client, AdminPath, HttpStatusCode.OK);
+        using var stillLimited = await client.GetAsync(IdentityPath);
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, stillLimited.StatusCode);
+        Assert.AreEqual(TimeSpan.FromSeconds(59), stillLimited.Headers.RetryAfter?.Delta);
+    }
+
     private static async Task AssertStatusAsync(HttpClient client, string path, HttpStatusCode expected)
     {
         using var response = await client.GetAsync(path);
         Assert.AreEqual(expected, response.StatusCode);
     }
 
-    private sealed class AuthorizationApplicationFactory : ApiApplicationFactory
+    private sealed class AuthorizationApplicationFactory(TimeProvider? clock = null) : ApiApplicationFactory
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
             builder.ConfigureTestServices(services =>
-                services.AddControllers().AddApplicationPart(typeof(AuthorizationProbeController).Assembly));
+            {
+                if (clock is not null)
+                    services.AddSingleton(clock);
+
+                services.AddControllers().AddApplicationPart(typeof(AuthorizationProbeController).Assembly);
+            });
         }
+    }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private long _timestamp;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp() => Interlocked.Read(ref _timestamp);
+
+        public void Advance(TimeSpan duration) => Interlocked.Add(ref _timestamp, duration.Ticks);
     }
 }
 

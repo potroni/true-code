@@ -1,13 +1,12 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.RateLimiting;
 using WebApi.Auth;
 using WebApi.Middleware;
 
 namespace WebApi.Controllers;
 
 [Authorize]
-[EnableRateLimiting(BusinessRateLimitPolicy.Name)]
+[BusinessRateLimit]
 public abstract class BaseApiController : ControllerBase
 {
     protected const string AdminRole = ApiAuthorization.AdminRole;
