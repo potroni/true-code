@@ -1,6 +1,6 @@
 using System.Globalization;
 using System.Threading.RateLimiting;
-using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Microsoft.AspNetCore.RateLimiting;
 using WebApi.Auth;
 
@@ -20,7 +20,7 @@ internal sealed class BusinessRateLimitPolicy : IRateLimiterPolicy<string>
             return RateLimitPartition.GetNoLimiter("anonymous");
         }
 
-        // решение: фиксированное окно ASP.NET Core даёт общий атомарный счётчик на пользователя в экземпляре API.
+        // решение: фиксированное окно ASP.NET Core дает общий атомарный счетчик на пользователя в экземпляре API.
         return RateLimitPartition.GetFixedWindowLimiter(userId.ToString(CultureInfo.InvariantCulture),
             _ => new FixedWindowRateLimiterOptions
             {
@@ -39,11 +39,10 @@ internal sealed class BusinessRateLimitPolicy : IRateLimiterPolicy<string>
                 Math.Ceiling(retryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
         }
 
-        await httpContext.RequestServices.GetRequiredService<IProblemDetailsService>().TryWriteAsync(
-            new ProblemDetailsContext
-            {
-                HttpContext = httpContext,
-                ProblemDetails = new ProblemDetails { Status = StatusCodes.Status429TooManyRequests }
-            });
+        // решение: ответ 429 всегда содержит ProblemDetails в JSON независимо от Accept.
+        var problem = httpContext.RequestServices.GetRequiredService<ProblemDetailsFactory>()
+            .CreateProblemDetails(httpContext, StatusCodes.Status429TooManyRequests);
+        await httpContext.Response.WriteAsJsonAsync(problem, options: null,
+            contentType: "application/problem+json", cancellationToken: cancellationToken);
     }
 }

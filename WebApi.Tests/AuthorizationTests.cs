@@ -110,7 +110,14 @@ public class AuthorizationTests
         Assert.AreEqual("application/problem+json", rejected.Content.Headers.ContentType?.MediaType);
         var problem = await rejected.Content.ReadFromJsonAsync<JsonElement>();
         Assert.AreEqual(429, problem.GetProperty("status").GetInt32());
-        await AssertStatusAsync(client, IdentityPath, HttpStatusCode.TooManyRequests);
+
+        using var htmlRequest = new HttpRequestMessage(HttpMethod.Get, IdentityPath);
+        htmlRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/html"));
+        using var htmlRejected = await client.SendAsync(htmlRequest);
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, htmlRejected.StatusCode);
+        Assert.AreEqual("application/problem+json", htmlRejected.Content.Headers.ContentType?.MediaType);
+        var htmlProblem = await htmlRejected.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(429, htmlProblem.GetProperty("status").GetInt32());
 
         using var login = await client.PostAsJsonAsync("/auth/login",
             new LoginRequest { Email = "user001@club.test", Password = "Password123!" });

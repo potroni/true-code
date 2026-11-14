@@ -20,5 +20,5 @@ public abstract class BaseApiController : ControllerBase
 
     protected ObjectResult ConflictWithReason(string reason) =>
         Problem(statusCode: StatusCodes.Status409Conflict,
-            extensions: new Dictionary<string, object?> { ["reason"] = reason });   //todo: think about separate service or fabric
+            extensions: new Dictionary<string, object?> { ["reason"] = reason });
 }
