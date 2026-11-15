@@ -12,6 +12,8 @@ public interface IUnitOfWork : IUnitOfWorkBase
 
     IEnrollmentRepository Enrollment { get; }
 
+    IdempotencyJournal Idempotency { get; }
+
     IPassRepository Pass { get; }
 }
 
@@ -20,7 +22,10 @@ public class UnitOfWork : UnitOfWorkBase, IUnitOfWork
     public UnitOfWork(ClubDbContext dbContext)
         : base(dbContext)
     {
+        Idempotency = new IdempotencyJournal(dbContext);
     }
+
+    public IdempotencyJournal Idempotency { get; }
 
     public IRoomRepository Room => GetRepository<Room, IRoomRepository>(set => new RoomRepository(set));
 

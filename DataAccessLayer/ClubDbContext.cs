@@ -19,6 +19,7 @@ public class ClubDbContext : DbContext
     public DbSet<Enrollment> Enrollments => Set<Enrollment>();
 
     public DbSet<WaitlistEntry> WaitlistEntries => Set<WaitlistEntry>();
+    public DbSet<IdempotencyEntry> IdempotencyEntries => Set<IdempotencyEntry>();
 
     public DbSet<Pass> Passes => Set<Pass>();
 
