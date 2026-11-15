@@ -10,7 +10,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace WebApi.Tests;
 
 [TestClass]
-public class IdempotencyJournalTests
+public class IdempotencyEntryRepositoryTests
 {
     private const string FirstResponse = "{\"id\":42,\"position\":4}";
 
@@ -159,9 +159,9 @@ public class IdempotencyJournalTests
         db.IdempotencyEntries.Add(entry);
         await db.SaveChangesAsync();
 
-        var journal = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().Idempotency;
+        var repository = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().Idempotency;
         await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
-            journal.FindAsync(entry.UserId, entry.Operation, key, entry.ClassId, entry.Seats));
+            repository.FindAsync(entry.UserId, entry.Operation, key, entry.ClassId, entry.Seats));
     }
 
     private static Task<int> BackendPidAsync(DbContext db, CancellationToken ct) =>

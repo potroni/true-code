@@ -2,7 +2,7 @@ using DataAccessLayer.Entities;
 
 namespace DataAccessLayer.Repositories;
 
-public interface IIdempotencyJournal
+public interface IIdempotencyEntryRepository
 {
     Task LockAsync(long userId, IdempotencyOperation operation, string key, CancellationToken ct = default);
 

@@ -41,16 +41,12 @@ public abstract class UnitOfWorkBase : IUnitOfWorkBase
     protected TRepository GetRepository<TEntity, TRepository>(Func<DbSet<TEntity>, TRepository> factory)
         where TEntity : class, IEntity
         where TRepository : class
-        => GetRepository<TRepository>(context => factory(context.Set<TEntity>()));
-
-    protected TRepository GetRepository<TRepository>(Func<DbContext, TRepository> factory)
-        where TRepository : class
     {
         var type = typeof(TRepository);
 
         if (!_repositories.TryGetValue(type, out var repository))
         {
-            repository = factory(DbContext);
+            repository = factory(DbContext.Set<TEntity>());
             _repositories[type] = repository;
         }
 

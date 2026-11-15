@@ -1,18 +1,21 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
+using Common.Database.Repositories.Generic;
 using DataAccessLayer.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 
 namespace DataAccessLayer.Repositories;
 
-internal sealed class IdempotencyJournal(DbContext db) : IIdempotencyJournal
+internal sealed class IdempotencyEntryRepository(DbSet<IdempotencyEntry> dbSet, DatabaseFacade database)
+    : GenericRepository<IdempotencyEntry>(dbSet), IIdempotencyEntryRepository
 {
     public async Task LockAsync(long userId, IdempotencyOperation operation, string key, CancellationToken ct = default)
     {
         RequireTransaction();
         var lockId = GetLockId(userId, operation, key);
-        await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockId})", ct);
+        await database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockId})", ct);
     }
 
     public async Task<IdempotencyLookup> FindAsync(
@@ -20,7 +23,7 @@ internal sealed class IdempotencyJournal(DbContext db) : IIdempotencyJournal
         CancellationToken ct = default)
     {
         var keyHash = HashKey(key);
-        var entry = await db.Set<IdempotencyEntry>().AsNoTracking().SingleOrDefaultAsync(
+        var entry = await _dbSet.AsNoTracking().SingleOrDefaultAsync(
             x => x.UserId == userId && x.Operation == operation && x.KeyHash == keyHash, ct);
 
         if (entry is null)
@@ -39,7 +42,7 @@ internal sealed class IdempotencyJournal(DbContext db) : IIdempotencyJournal
         long userId, IdempotencyOperation operation, string key, long classId, int seats, string responseBody)
     {
         RequireTransaction();
-        db.Set<IdempotencyEntry>().Add(new IdempotencyEntry
+        _dbSet.Add(new IdempotencyEntry
         {
             UserId = userId,
             Operation = operation,
@@ -53,7 +56,7 @@ internal sealed class IdempotencyJournal(DbContext db) : IIdempotencyJournal
 
     private void RequireTransaction()
     {
-        if (db.Database.CurrentTransaction is null)
+        if (database.CurrentTransaction is null)
             throw new InvalidOperationException("An active transaction is required for the idempotency journal.");
     }
 

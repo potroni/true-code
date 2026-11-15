@@ -15,7 +15,7 @@ public interface IUnitOfWork : IUnitOfWorkBase
 
     IEnrollmentRepository Enrollment { get; }
 
-    IIdempotencyJournal Idempotency { get; }
+    IIdempotencyEntryRepository Idempotency { get; }
 
     IPassRepository Pass { get; }
 }
@@ -27,8 +27,9 @@ public class UnitOfWork : UnitOfWorkBase, IUnitOfWork
     {
     }
 
-    public IIdempotencyJournal Idempotency =>
-        GetRepository<IIdempotencyJournal>(context => new IdempotencyJournal(context));
+    public IIdempotencyEntryRepository Idempotency =>
+        GetRepository<IdempotencyEntry, IIdempotencyEntryRepository>(
+            set => new IdempotencyEntryRepository(set, DbContext.Database));
 
     public IRoomRepository Room => GetRepository<Room, IRoomRepository>(set => new RoomRepository(set));
 
