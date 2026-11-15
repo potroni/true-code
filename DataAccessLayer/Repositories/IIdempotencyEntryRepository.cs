@@ -1,8 +1,9 @@
+using Common.Database.Repositories.Generic;
 using DataAccessLayer.Entities;
 
 namespace DataAccessLayer.Repositories;
 
-public interface IIdempotencyEntryRepository
+public interface IIdempotencyEntryRepository : IGenericRepository<IdempotencyEntry>
 {
     Task LockAsync(long userId, IdempotencyOperation operation, string key, CancellationToken ct = default);
 
