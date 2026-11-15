@@ -1,14 +1,12 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
-using DataAccessLayer.Configurations;
 using DataAccessLayer.Entities;
 using Microsoft.EntityFrameworkCore;
-using Npgsql;
 
 namespace DataAccessLayer.Repositories;
 
-public class IdempotencyJournal(ClubDbContext db)
+internal sealed class IdempotencyJournal(DbContext db) : IIdempotencyJournal
 {
     public async Task LockAsync(long userId, IdempotencyOperation operation, string key, CancellationToken ct = default)
     {
@@ -22,7 +20,7 @@ public class IdempotencyJournal(ClubDbContext db)
         CancellationToken ct = default)
     {
         var keyHash = HashKey(key);
-        var entry = await db.IdempotencyEntries.AsNoTracking().SingleOrDefaultAsync(
+        var entry = await db.Set<IdempotencyEntry>().AsNoTracking().SingleOrDefaultAsync(
             x => x.UserId == userId && x.Operation == operation && x.KeyHash == keyHash, ct);
 
         if (entry is null)
@@ -41,7 +39,7 @@ public class IdempotencyJournal(ClubDbContext db)
         long userId, IdempotencyOperation operation, string key, long classId, int seats, string responseBody)
     {
         RequireTransaction();
-        db.IdempotencyEntries.Add(new IdempotencyEntry
+        db.Set<IdempotencyEntry>().Add(new IdempotencyEntry
         {
             UserId = userId,
             Operation = operation,
@@ -52,13 +50,6 @@ public class IdempotencyJournal(ClubDbContext db)
             ResponseBody = responseBody
         });
     }
-
-    public static bool IsScopeConflict(DbUpdateException exception) =>
-        exception.InnerException is PostgresException
-        {
-            SqlState: PostgresErrorCodes.UniqueViolation,
-            ConstraintName: IdempotencyEntryConfiguration.ScopeIndexName
-        };
 
     private void RequireTransaction()
     {

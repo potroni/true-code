@@ -111,13 +111,31 @@ public class IdempotencyJournalTests
             if (!secondSave.IsCompleted && !ct.IsCancellationRequested && db.Database.CurrentTransaction is not null)
                 await timeout.CancelAsync();
 
-            var error = await Assert.ThrowsExceptionAsync<DbUpdateException>(() => secondSave);
-            Assert.IsTrue(IdempotencyJournal.IsScopeConflict(error));
+            await Assert.ThrowsExceptionAsync<IdempotencyKeyAlreadyExistsException>(() => secondSave);
         }
 
         await secondTransaction.RollbackAsync(ct);
+        second.DbContext.ChangeTracker.Clear();
         var replay = await second.Idempotency.FindAsync(users[0], operation, key, classes[0], 1, ct);
         Assert.AreEqual(new IdempotencyLookup(IdempotencyLookupStatus.Replay, FirstResponse), replay);
+    }
+
+    [TestMethod]
+    public async Task SaveChangesPreservesOtherConstraintViolations()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = (ClubDbContext)unitOfWork.DbContext;
+        var userId = await db.Users.Select(x => x.Id).FirstAsync();
+        var classId = await db.Classes.Select(x => x.Id).FirstAsync();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+
+        unitOfWork.Idempotency.AddSuccess(
+            userId, IdempotencyOperation.CreateEnrollment, Guid.NewGuid().ToString("N"),
+            classId, 0, FirstResponse);
+
+        await Assert.ThrowsExceptionAsync<DbUpdateException>(() => unitOfWork.SaveChangesAsync());
     }
 
     [TestMethod]
