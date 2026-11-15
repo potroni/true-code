@@ -166,6 +166,7 @@ public static class DatabaseSeeder
                 ClassId = scheduledClass.Id,
                 Seats = seats,
                 Status = cancelled ? "cancelled" : "active",
+                RefundedVisits = cancelled ? 0 : null,
                 CreatedAt = createdAt,
                 CancelledAt = cancelled
                     ? CancelledBetween(createdAt, scheduledClass.StartsAt, random)

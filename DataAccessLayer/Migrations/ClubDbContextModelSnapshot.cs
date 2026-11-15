@@ -60,6 +60,14 @@ namespace DataAccessLayer.Migrations
 
                     b.HasIndex("RoomId");
 
+                    b.HasIndex("StartsAt", "Id")
+                        .HasDatabaseName("ix_classes_scheduled_start_id")
+                        .HasFilter("NOT is_cancelled");
+
+                    b.HasIndex("RoomId", "StartsAt", "Id")
+                        .HasDatabaseName("ix_classes_scheduled_room_start_id")
+                        .HasFilter("NOT is_cancelled");
+
                     b.ToTable("classes", (string)null);
                 });
 
@@ -84,6 +92,10 @@ namespace DataAccessLayer.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at");
 
+                    b.Property<int?>("RefundedVisits")
+                        .HasColumnType("integer")
+                        .HasColumnName("refunded_visits");
+
                     b.Property<int>("Seats")
                         .HasColumnType("integer")
                         .HasColumnName("seats");
@@ -103,7 +115,16 @@ namespace DataAccessLayer.Migrations
 
                     b.HasIndex("UserId");
 
-                    b.ToTable("enrollments", (string)null);
+                    b.HasIndex("ClassId", "UserId")
+                        .HasDatabaseName("ix_enrollments_active_class_user")
+                        .HasFilter("status = 'active'");
+
+                    NpgsqlIndexBuilderExtensions.IncludeProperties(b.HasIndex("ClassId", "UserId"), new[] { "Seats" });
+
+                    b.ToTable("enrollments", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_enrollments_refunded_visits", "(status = 'active' AND refunded_visits IS NULL) OR (status = 'cancelled' AND refunded_visits IS NOT NULL AND refunded_visits >= 0)");
+                        });
                 });
 
             modelBuilder.Entity("DataAccessLayer.Entities.IdempotencyEntry", b =>
