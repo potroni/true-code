@@ -11,6 +11,7 @@ using Microsoft.IdentityModel.Tokens;
 using StackExchange.Redis;
 using WebApi.Auth;
 using WebApi.Middleware;
+using WebApi.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -31,6 +32,7 @@ builder.Services.AddDbContext<ClubDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
 
 builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
+builder.Services.AddScoped<IEnrollmentService, EnrollmentService>();
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
     ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")!));
