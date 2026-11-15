@@ -186,6 +186,55 @@ namespace DataAccessLayer.Migrations
                     b.ToTable("users", (string)null);
                 });
 
+            modelBuilder.Entity("DataAccessLayer.Entities.WaitlistEntry", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<long>("ClassId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("class_id");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("created_at");
+
+                    b.Property<int>("Seats")
+                        .HasColumnType("integer")
+                        .HasColumnName("seats");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.Property<long>("UserId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("user_id");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId", "ClassId")
+                        .IsUnique()
+                        .HasDatabaseName("ux_waitlist_entries_waiting_user_class")
+                        .HasFilter("status = 'waiting'");
+
+                    b.HasIndex("ClassId", "CreatedAt", "Id")
+                        .HasDatabaseName("ix_waitlist_entries_waiting_fifo")
+                        .HasFilter("status = 'waiting'");
+
+                    b.ToTable("waitlist_entries", null, t =>
+                        {
+                            t.HasCheckConstraint("ck_waitlist_entries_seats", "seats > 0");
+
+                            t.HasCheckConstraint("ck_waitlist_entries_status", "status IN ('waiting', 'cancelled', 'promoted', 'closed')");
+                        });
+                });
+
             modelBuilder.Entity("DataAccessLayer.Entities.Class", b =>
                 {
                     b.HasOne("DataAccessLayer.Entities.Room", "Room")
@@ -216,6 +265,21 @@ namespace DataAccessLayer.Migrations
 
             modelBuilder.Entity("DataAccessLayer.Entities.Pass", b =>
                 {
+                    b.HasOne("DataAccessLayer.Entities.User", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("DataAccessLayer.Entities.WaitlistEntry", b =>
+                {
+                    b.HasOne("DataAccessLayer.Entities.Class", null)
+                        .WithMany()
+                        .HasForeignKey("ClassId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
                     b.HasOne("DataAccessLayer.Entities.User", null)
                         .WithMany()
                         .HasForeignKey("UserId")
