@@ -17,6 +17,7 @@ public class Enrollment : IEntity
     public DateTime CreatedAt { get; set; }
 
     public DateTime? CancelledAt { get; set; }
+    public int? RefundedVisits { get; set; }
 
     public Class Class { get; set; } = null!;
 }

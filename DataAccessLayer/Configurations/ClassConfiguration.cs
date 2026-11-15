@@ -20,6 +20,18 @@ public class ClassConfiguration : IEntityTypeConfiguration<Class>
         builder.Property(x => x.Capacity).HasColumnName("capacity");
         builder.Property(x => x.IsCancelled).HasColumnName("is_cancelled");
 
+        const string scheduledFilter = "NOT is_cancelled";
+
+        builder.HasIndex(x => x.RoomId);
+
+        builder.HasIndex(x => new { x.StartsAt, x.Id })
+            .HasDatabaseName("ix_classes_scheduled_start_id")
+            .HasFilter(scheduledFilter);
+
+        builder.HasIndex(x => new { x.RoomId, x.StartsAt, x.Id })
+            .HasDatabaseName("ix_classes_scheduled_room_start_id")
+            .HasFilter(scheduledFilter);
+
         builder
             .HasOne(x => x.Room)
             .WithMany()
