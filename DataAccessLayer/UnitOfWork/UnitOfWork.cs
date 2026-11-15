@@ -1,9 +1,6 @@
 using Common.Database.UnitOfWork;
-using DataAccessLayer.Configurations;
 using DataAccessLayer.Entities;
 using DataAccessLayer.Repositories;
-using Microsoft.EntityFrameworkCore;
-using Npgsql;
 
 namespace DataAccessLayer.UnitOfWork;
 
@@ -39,20 +36,4 @@ public class UnitOfWork : UnitOfWorkBase, IUnitOfWork
         GetRepository<Enrollment, IEnrollmentRepository>(set => new EnrollmentRepository(set));
 
     public IPassRepository Pass => GetRepository<Pass, IPassRepository>(set => new PassRepository(set));
-
-    public override async Task SaveChangesAsync(CancellationToken ct = default)
-    {
-        try
-        {
-            await base.SaveChangesAsync(ct);
-        }
-        catch (DbUpdateException exception) when (exception.InnerException is PostgresException
-        {
-            SqlState: PostgresErrorCodes.UniqueViolation,
-            ConstraintName: IdempotencyEntryConfiguration.ScopeIndexName
-        })
-        {
-            throw new IdempotencyKeyAlreadyExistsException(exception);
-        }
-    }
 }

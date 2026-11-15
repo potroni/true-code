@@ -6,6 +6,7 @@ using DataAccessLayer.Repositories;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 
 namespace WebApi.Tests;
 
@@ -111,7 +112,11 @@ public class IdempotencyEntryRepositoryTests
             if (!secondSave.IsCompleted && !ct.IsCancellationRequested && db.Database.CurrentTransaction is not null)
                 await timeout.CancelAsync();
 
-            await Assert.ThrowsExceptionAsync<IdempotencyKeyAlreadyExistsException>(() => secondSave);
+            var exception = await Assert.ThrowsExceptionAsync<DbUpdateException>(() => secondSave);
+            Assert.IsInstanceOfType<PostgresException>(exception.InnerException);
+            var postgresException = (PostgresException)exception.InnerException!;
+            Assert.AreEqual(PostgresErrorCodes.UniqueViolation, postgresException.SqlState);
+            Assert.AreEqual("ux_idempotency_entries_user_operation_hash", postgresException.ConstraintName);
         }
 
         await secondTransaction.RollbackAsync(ct);
