@@ -26,8 +26,7 @@ public class EnrollmentRepository : GenericRepository<Enrollment>, IEnrollmentRe
     {
         // решение: отключаем фильтр занятий для карточки, чтобы показывать и отмененные клубом занятия.
         var query =
-            from enrollment in _dbSet.IgnoreQueryFilters()
-            where enrollment.Id == enrollmentId && enrollment.UserId == userId
+            from enrollment in OwnedEnrollment(enrollmentId, userId).IgnoreQueryFilters()
             join pass in _passes on enrollment.UserId equals pass.UserId
             let activity = enrollment.Class
             select new EnrollmentDetails(
@@ -49,12 +48,15 @@ public class EnrollmentRepository : GenericRepository<Enrollment>, IEnrollmentRe
     }
 
     public Task<long?> FindOwnedClassIdAsync(long enrollmentId, long userId, CancellationToken ct = default) =>
-        _dbSet.Where(x => x.Id == enrollmentId && x.UserId == userId)
+        OwnedEnrollment(enrollmentId, userId)
             .Select(x => (long?)x.ClassId)
             .SingleOrDefaultAsync(ct);
 
     public Task<Enrollment?> FindOwnedAsync(long enrollmentId, long userId, CancellationToken ct = default) =>
-        _dbSet.AsNoTracking().SingleOrDefaultAsync(x => x.Id == enrollmentId && x.UserId == userId, ct);
+        OwnedEnrollment(enrollmentId, userId).AsNoTracking().SingleOrDefaultAsync(ct);
+
+    private IQueryable<Enrollment> OwnedEnrollment(long enrollmentId, long userId) =>
+        _dbSet.Where(x => x.Id == enrollmentId && x.UserId == userId);
 
     public Task<long> SumActiveSeatsAsync(long classId, CancellationToken ct = default) =>
         _dbSet.Where(x => x.ClassId == classId && x.Status == "active")

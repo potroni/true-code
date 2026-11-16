@@ -109,14 +109,12 @@ public class BookingLocksTests
     {
         await using var factory = new ApiApplicationFactory();
         await using var scope = factory.Services.CreateAsyncScope();
-        var unit = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
-        var db = (ClubDbContext)unit.DbContext;
+        await using var changeScope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<ClubDbContext>();
+        var unit = changeScope.ServiceProvider.GetRequiredService<IUnitOfWork>();
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
         var service = new EnrollmentService(unit, new TestClock(now));
-        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
-            service.PrepareSeatChangeAsync(1, 1, 2, default));
 
-        await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
         var enrollment = await AddEnrollmentAsync(db, classStarted ? now : now.AddHours(1));
         enrollment.Status = status;
         if (status == "cancelled")
@@ -125,24 +123,29 @@ public class BookingLocksTests
             enrollment.RefundedVisits = enrollment.Seats;
         }
         enrollment.Class.IsCancelled = classCancelled;
-        await db.SaveChangesAsync();
-
-        Assert.IsInstanceOfType<SeatChangePreparation.NotFound>(
-            await service.PrepareSeatChangeAsync(enrollment.Id, long.MaxValue, enrollment.Seats, default));
-        Assert.IsInstanceOfType<SeatChangePreparation.NotFound>(
-            await service.PrepareSeatChangeAsync(long.MaxValue, enrollment.UserId, enrollment.Seats, default));
-
-        var result = await service.PrepareSeatChangeAsync(enrollment.Id, enrollment.UserId, enrollment.Seats, default);
-        if (reason is null)
+        try
         {
-            Assert.IsInstanceOfType<SeatChangePreparation.Ready>(result);
-            var ready = (SeatChangePreparation.Ready)result;
-            Assert.AreEqual(0, ready.SeatDelta);
-            Assert.IsNull(ready.Pass);
+            await db.SaveChangesAsync();
+            Assert.IsInstanceOfType<ChangeSeatsResult.NotFound>(
+                await service.ChangeSeatsAsync(enrollment.Id, long.MaxValue, enrollment.Seats, default));
+            Assert.IsInstanceOfType<ChangeSeatsResult.NotFound>(
+                await service.ChangeSeatsAsync(long.MaxValue, enrollment.UserId, enrollment.Seats, default));
+
+            var result = await service.ChangeSeatsAsync(enrollment.Id, enrollment.UserId, enrollment.Seats, default);
+            if (reason is null)
+            {
+                Assert.IsInstanceOfType<ChangeSeatsResult.Success>(result);
+                Assert.AreEqual(enrollment.Seats, ((ChangeSeatsResult.Success)result).Details.Seats);
+            }
+            else
+            {
+                Assert.AreEqual(new ChangeSeatsResult.Conflict(reason), result);
+            }
         }
-        else
+        finally
         {
-            Assert.AreEqual(new SeatChangePreparation.Conflict(reason), result);
+            db.RemoveRange(enrollment, enrollment.Class);
+            await db.SaveChangesAsync();
         }
     }
 
@@ -161,54 +164,65 @@ public class BookingLocksTests
         var clock = new TestClock(now);
         var enrollment = await AddEnrollmentAsync(db, now.AddHours(1));
         var service = new EnrollmentService(change, clock);
+        var pass = await db.Passes.AsNoTracking().SingleAsync(x => x.UserId == enrollment.UserId);
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var ct = timeout.Token;
-        await using var blockingTransaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
-        if (waitForClass)
-        {
-            Assert.IsNotNull(await blocker.Class.LockByIdAsync(enrollment.ClassId, ct));
-            enrollment.Seats = 4;
-            await db.SaveChangesAsync(ct);
-        }
-        else
-        {
-            Assert.HasCount(1, await blocker.Pass.LockByUsersAsync([enrollment.UserId], ct));
-        }
-
-        await using var changeTransaction = await change.DbContext.Database
-            .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
-        var changePid = ((NpgsqlConnection)change.DbContext.Database.GetDbConnection()).ProcessID;
-        var preparation = service.PrepareSeatChangeAsync(enrollment.Id, enrollment.UserId, 3, ct);
+        Task<ChangeSeatsResult>? seatChange = null;
         try
         {
-            while (!preparation.IsCompleted && !await db.Database.SqlQuery<bool>(
-                $"""SELECT pg_backend_pid() = ANY(pg_blocking_pids({changePid})) AS "Value" """).SingleAsync(ct))
+            await using var blockingTransaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+            if (waitForClass)
+            {
+                Assert.IsNotNull(await blocker.Class.LockByIdAsync(enrollment.ClassId, ct));
+                enrollment.Seats = 4;
+                await db.SaveChangesAsync(ct);
+            }
+            else
+            {
+                Assert.HasCount(1, await blocker.Pass.LockByUsersAsync([enrollment.UserId], ct));
+            }
+
+            seatChange = service.ChangeSeatsAsync(enrollment.Id, enrollment.UserId, 3, ct);
+            while (!seatChange.IsCompleted && !await db.Database.SqlQuery<bool>(
+                $"""SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS "Value" """)
+                .SingleAsync(ct))
             {
                 await Task.Delay(20, ct);
             }
-            Assert.IsFalse(preparation.IsCompleted);
+            Assert.IsFalse(seatChange.IsCompleted);
             if (!waitForClass)
                 clock.SetUtcNow(now.AddHours(1));
 
             await blockingTransaction.CommitAsync(ct);
-            var result = await preparation;
+            var result = await seatChange;
             if (waitForClass)
             {
-                Assert.IsInstanceOfType<SeatChangePreparation.Ready>(result);
-                var ready = (SeatChangePreparation.Ready)result;
-                Assert.AreEqual(4, ready.Enrollment.Seats);
-                Assert.AreEqual(-1, ready.SeatDelta);
-                Assert.AreEqual(enrollment.UserId, ready.Pass?.UserId);
+                Assert.IsInstanceOfType<ChangeSeatsResult.Success>(result);
+                var details = ((ChangeSeatsResult.Success)result).Details;
+                Assert.AreEqual(3, details.Seats);
+                Assert.AreEqual(pass.RemainingVisits + 1, details.Pass.RemainingVisits);
             }
             else
             {
-                Assert.AreEqual(new SeatChangePreparation.Conflict("class-started"), result);
+                Assert.AreEqual(new ChangeSeatsResult.Conflict("class-started"), result);
             }
         }
         finally
         {
             await timeout.CancelAsync();
+            try
+            {
+                if (seatChange is { IsCompletedSuccessfully: false })
+                    await seatChange;
+            }
+            finally
+            {
+                db.RemoveRange(enrollment, enrollment.Class);
+                await db.SaveChangesAsync();
+                await db.Passes.Where(x => x.Id == pass.Id)
+                    .ExecuteUpdateAsync(x => x.SetProperty(p => p.RemainingVisits, pass.RemainingVisits));
+            }
         }
     }
 

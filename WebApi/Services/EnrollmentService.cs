@@ -63,35 +63,39 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         await using var transaction = await unitOfWork.DbContext.Database
             .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
 
-        var preparation = await PrepareSeatChangeAsync(enrollmentId, userId, seats, ct);
-        if (preparation is SeatChangePreparation.NotFound)
+        var classId = await unitOfWork.Enrollment.FindOwnedClassIdAsync(enrollmentId, userId, ct);
+        if (classId is null)
             return new ChangeSeatsResult.NotFound();
-        if (preparation is SeatChangePreparation.Conflict conflict)
-            return new ChangeSeatsResult.Conflict(conflict.Reason);
 
-        var (enrollment, activity, seatDelta, pass) = (SeatChangePreparation.Ready)preparation;
-        if (seatDelta > 0)
-        {
-            var reason = await GetAdditionalSeatsConflictAsync(activity, pass!, seatDelta, requestedAt, ct);
-            if (reason is not null)
-                return new ChangeSeatsResult.Conflict(reason);
-        }
+        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
+        if (activity is null)
+            return new ChangeSeatsResult.NotFound();
 
-        if (pass is not null)
+        var enrollment = await unitOfWork.Enrollment.FindOwnedAsync(enrollmentId, userId, ct);
+        if (enrollment is null || enrollment.ClassId != activity.Id)
+            return new ChangeSeatsResult.NotFound();
+        if (enrollment.Status == "cancelled")
+            return new ChangeSeatsResult.Conflict("enrollment-cancelled");
+        if (activity.IsCancelled)
+            return new ChangeSeatsResult.Conflict("class-cancelled");
+        if (HasStarted(activity))
+            return new ChangeSeatsResult.Conflict("class-started");
+
+        var seatDelta = seats - enrollment.Seats;
+        if (seatDelta != 0)
         {
-            var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
-            var passEntry = unitOfWork.DbContext.Attach(pass);
-            try
+            var pass = await LockPassAsync(userId, ct);
+            if (HasStarted(activity))
+                return new ChangeSeatsResult.Conflict("class-started");
+
+            if (seatDelta > 0)
             {
-                enrollment.Seats = seats;
-                pass.RemainingVisits -= seatDelta;
-                await unitOfWork.SaveChangesAsync(ct);
+                var reason = await GetAdditionalSeatsConflictAsync(activity, pass, seatDelta, requestedAt, ct);
+                if (reason is not null)
+                    return new ChangeSeatsResult.Conflict(reason);
             }
-            finally
-            {
-                enrollmentEntry.State = EntityState.Detached;
-                passEntry.State = EntityState.Detached;
-            }
+
+            await SaveSeatChangeAsync(enrollment, pass, seats, seatDelta, ct);
         }
 
         var details = await GetDetailsAsync(enrollmentId, userId, ct)
@@ -100,40 +104,22 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         return new ChangeSeatsResult.Success(details);
     }
 
-    internal async Task<SeatChangePreparation> PrepareSeatChangeAsync(
-        long enrollmentId, long userId, int seats, CancellationToken ct)
+    private async Task SaveSeatChangeAsync(
+        Enrollment enrollment, Pass pass, int seats, int seatDelta, CancellationToken ct)
     {
-        if (unitOfWork.DbContext.Database.CurrentTransaction is null)
-            throw new InvalidOperationException("An active transaction is required to prepare a seat change.");
-
-        var classId = await unitOfWork.Enrollment.FindOwnedClassIdAsync(enrollmentId, userId, ct);
-        if (classId is null)
-            return new SeatChangePreparation.NotFound();
-
-        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
-        if (activity is null)
-            return new SeatChangePreparation.NotFound();
-
-        var enrollment = await unitOfWork.Enrollment.FindOwnedAsync(enrollmentId, userId, ct);
-        if (enrollment is null || enrollment.ClassId != activity.Id)
-            return new SeatChangePreparation.NotFound();
-
-        if (enrollment.Status == "cancelled")
-            return new SeatChangePreparation.Conflict("enrollment-cancelled");
-        if (activity.IsCancelled)
-            return new SeatChangePreparation.Conflict("class-cancelled");
-        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
-            return new SeatChangePreparation.Conflict("class-started");
-
-        var seatDelta = seats - enrollment.Seats;
-        if (seatDelta == 0)
-            return new SeatChangePreparation.Ready(enrollment, activity, seatDelta, Pass: null);
-
-        var pass = (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
-        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
-            return new SeatChangePreparation.Conflict("class-started");
-
-        return new SeatChangePreparation.Ready(enrollment, activity, seatDelta, pass);
+        var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
+        var passEntry = unitOfWork.DbContext.Attach(pass);
+        try
+        {
+            enrollment.Seats = seats;
+            pass.RemainingVisits -= seatDelta;
+            await unitOfWork.SaveChangesAsync(ct);
+        }
+        finally
+        {
+            enrollmentEntry.State = EntityState.Detached;
+            passEntry.State = EntityState.Detached;
+        }
     }
 
     public async Task<CreateEnrollmentResult> CreateAsync(
@@ -186,17 +172,22 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         if (activity.IsCancelled)
             return (null, new CreateEnrollmentResult.Conflict("class-cancelled"));
 
-        var pass = (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
+        var pass = await LockPassAsync(userId, ct);
         var reason = await GetAdditionalSeatsConflictAsync(activity, pass, seats, requestedAt, ct);
         return reason is null ? (pass, null) : (null, new CreateEnrollmentResult.Conflict(reason));
     }
+
+    private async Task<Pass> LockPassAsync(long userId, CancellationToken ct) =>
+        (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
+
+    private bool HasStarted(Class activity) => activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime;
 
     private async Task<string?> GetAdditionalSeatsConflictAsync(
         Class activity, Pass pass, int additionalSeats, DateTime requestedAt, CancellationToken ct)
     {
         // решение: считаем только активные брони, поскольку заявки очереди не резервируют места.
         var occupiedSeats = await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct);
-        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
+        if (HasStarted(activity))
             return "class-started";
         if (activity.Capacity - occupiedSeats < additionalSeats)
             return "capacity-exceeded";
@@ -250,16 +241,4 @@ public abstract record ChangeSeatsResult
     public sealed record NotFound : ChangeSeatsResult;
 
     public sealed record Conflict(string Reason) : ChangeSeatsResult;
-}
-
-internal abstract record SeatChangePreparation
-{
-    private SeatChangePreparation() { }
-
-    internal sealed record Ready(Enrollment Enrollment, Class Activity, int SeatDelta, Pass? Pass)
-        : SeatChangePreparation;
-
-    internal sealed record NotFound : SeatChangePreparation;
-
-    internal sealed record Conflict(string Reason) : SeatChangePreparation;
 }
