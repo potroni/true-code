@@ -332,6 +332,70 @@ public class BookingLocksTests
         Assert.AreEqual(0, (await unitOfWork.Pass.LockByUsersAsync([])).Count);
     }
 
+    [TestMethod]
+    public async Task CancellationWaitsForCandidatePassAndChecksStartAfterTheWait()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var blockerScope = factory.Services.CreateAsyncScope();
+        await using var cancellationScope = factory.Services.CreateAsyncScope();
+        var blocker = blockerScope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var cancellation = cancellationScope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = (ClubDbContext)blocker.DbContext;
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var clock = new TestClock(now);
+        var enrollment = await AddEnrollmentAsync(db, now.AddHours(1));
+        var candidate = new WaitlistEntry
+        {
+            ClassId = enrollment.ClassId,
+            UserId = await db.Passes.Where(x => x.UserId != enrollment.UserId).Select(x => x.UserId).FirstAsync(),
+            Seats = 1,
+            CreatedAt = now.UtcDateTime
+        };
+        db.WaitlistEntries.Add(candidate);
+        await db.SaveChangesAsync();
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+        Task<CancelEnrollmentResult>? request = null;
+        try
+        {
+            var service = new EnrollmentService(cancellation, clock);
+            Assert.AreEqual(new CancelEnrollmentResult.NotFound(),
+                await service.CancelAsync(enrollment.Id, candidate.UserId, ct));
+
+            await using var transaction = await db.Database.BeginTransactionAsync(ct);
+            Assert.HasCount(1, await blocker.Pass.LockByUsersAsync([candidate.UserId], ct));
+            request = service.CancelAsync(enrollment.Id, enrollment.UserId, ct);
+            while (!request.IsCompleted && !await db.Database.SqlQuery<bool>(
+                $"""SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS "Value" """)
+                .SingleAsync(ct))
+            {
+                await Task.Delay(20, ct);
+            }
+            Assert.IsFalse(request.IsCompleted);
+            clock.SetUtcNow(now.AddHours(1));
+            await transaction.CommitAsync(ct);
+
+            Assert.AreEqual(new CancelEnrollmentResult.Conflict("class-started"), await request);
+            Assert.AreEqual("active", await db.Enrollments.Where(x => x.Id == enrollment.Id)
+                .Select(x => x.Status).SingleAsync(ct));
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+            try
+            {
+                if (request is { IsCompletedSuccessfully: false })
+                    await request;
+            }
+            finally
+            {
+                db.RemoveRange(candidate, enrollment, enrollment.Class);
+                await db.SaveChangesAsync();
+            }
+        }
+    }
+
     private static async Task<Enrollment> AddEnrollmentAsync(ClubDbContext db, DateTimeOffset startsAt)
     {
         var userId = await db.Passes.OrderBy(x => x.Id).Select(x => x.UserId).FirstAsync();

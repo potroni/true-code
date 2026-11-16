@@ -36,8 +36,35 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
 {
     private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
 
-    public Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct) =>
-        Task.FromResult<CancelEnrollmentResult>(new CancelEnrollmentResult.NotImplemented());
+    public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)
+    {
+        await using var transaction = await unitOfWork.DbContext.Database
+            .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+
+        var classId = await unitOfWork.Enrollment.FindOwnedClassIdAsync(enrollmentId, userId, ct);
+        if (classId is null)
+            return new CancelEnrollmentResult.NotFound();
+
+        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
+        if (activity is null)
+            return new CancelEnrollmentResult.NotFound();
+
+        var enrollment = await unitOfWork.Enrollment.FindOwnedAsync(enrollmentId, userId, ct);
+        if (enrollment is null || enrollment.ClassId != activity.Id)
+            return new CancelEnrollmentResult.NotFound();
+        if (enrollment.Status == "cancelled")
+            return new CancelEnrollmentResult.NotImplemented();
+
+        // решение: для отмененного клубом занятия очередь не продвигаем и блокируем только абонемент владельца.
+        var waiting = activity.IsCancelled ? [] : await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct);
+        var passUserIds = waiting.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
+        await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
+
+        if (!activity.IsCancelled && HasStarted(activity))
+            return new CancelEnrollmentResult.Conflict("class-started");
+
+        return new CancelEnrollmentResult.NotImplemented();
+    }
 
     public async Task<EnrollmentDetailsResponse?> GetDetailsAsync(
         long enrollmentId, long userId, CancellationToken ct)

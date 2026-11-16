@@ -15,6 +15,8 @@ public interface IUnitOfWork : IUnitOfWorkBase
     IIdempotencyEntryRepository Idempotency { get; }
 
     IPassRepository Pass { get; }
+
+    IWaitlistRepository Waitlist { get; }
 }
 
 public class UnitOfWork : UnitOfWorkBase, IUnitOfWork
@@ -39,4 +41,7 @@ public class UnitOfWork : UnitOfWorkBase, IUnitOfWork
 
     public IPassRepository Pass =>
         GetRepository<Pass, IPassRepository>(set => new PassRepository(set, DbContext.Database));
+
+    public IWaitlistRepository Waitlist =>
+        GetRepository<WaitlistEntry, IWaitlistRepository>(set => new WaitlistRepository(set));
 }
