@@ -170,6 +170,76 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    public async Task CancellationRejectsStartedClassBeforeWaitingForCandidatePass()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
+        var candidate = await AddBookingClientAsync(db, now.UtcDateTime, visits: 2);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime.AddDays(-1), capacity: 2);
+        var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
+        var waiting = await AddWaitingAsync(db, candidate, classId, now.UtcDateTime, seats: 2);
+        using var client = CreateAuthenticatedClient(factory, owner);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([candidate], ct));
+        using var response = await client.PostAsync($"/enrollments/{booking.Id}/cancel", null, ct);
+        Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+        Assert.AreEqual("class-started", problem.GetProperty("reason").GetString());
+        await gate.CommitAsync(ct);
+
+        await db.Entry(booking).ReloadAsync(ct);
+        Assert.AreEqual("active", booking.Status);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 0);
+        await AssertPromotionAsync(db, waiting, WaitlistStatus.Waiting, visits: 2);
+    }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task PromotionUsesRequestDateWhenCandidatePassLockWaitCrossesUtcMidnight(bool cancel)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 23, 59, 59, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
+        var candidate = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1,
+            validUntil: DateOnly.FromDateTime(now.UtcDateTime));
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
+        var waiting = await AddWaitingAsync(db, candidate, classId, now.UtcDateTime, seats: 1);
+        using var client = CreateAuthenticatedClient(factory, owner);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([candidate], ct));
+        var pending = cancel
+            ? client.PostAsync($"/enrollments/{booking.Id}/cancel", null, ct)
+            : client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 1 }, ct);
+        await WaitForBlockedRequestsAsync(db, 1, ct);
+        var promotedAt = now.AddSeconds(1);
+        clock.SetUtcNow(promotedAt);
+        await gate.CommitAsync(ct);
+
+        using var response = await pending;
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        await AssertPromotionAsync(db, waiting, WaitlistStatus.Promoted, visits: 0);
+        var createdAt = await db.Set<Enrollment>().Where(x => x.ClassId == classId && x.UserId == candidate)
+            .Select(x => x.CreatedAt).SingleAsync(ct);
+        Assert.AreEqual(promotedAt.UtcDateTime, createdAt);
+    }
+
+    [TestMethod]
     public async Task CancellationRollsBackIfClassStartsWhileWritingChanges()
     {
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);

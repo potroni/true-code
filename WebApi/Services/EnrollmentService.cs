@@ -57,6 +57,8 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         if (enrollment.Status == "cancelled")
             return new CancelEnrollmentResult.Success(
                 new CancelEnrollmentResponse(enrollment.Id, enrollment.RefundedVisits!.Value));
+        if (!activity.IsCancelled && HasStarted(activity))
+            return new CancelEnrollmentResult.Conflict("class-started");
 
         var (candidates, availableSeats) = await GetPromotionCandidatesAsync(activity, enrollment.Seats, ct);
         var passUserIds = candidates.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
@@ -85,7 +87,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             enrollment.CancelledAt = cancelledAt;
             enrollment.RefundedVisits = refundedVisits;
             pass.RemainingVisits = (int)remainingVisits;
-            await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, cancelledAt, trackedEntries, ct);
+            await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, requestedAt, cancelledAt, trackedEntries, ct);
             await unitOfWork.SaveChangesAsync(ct);
             if (!activity.IsCancelled && HasStarted(activity))
                 return new CancelEnrollmentResult.Conflict("class-started");
@@ -123,11 +125,12 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         IReadOnlyList<WaitlistEntry> waiting,
         IReadOnlyDictionary<long, Pass> passesByUser,
         long availableSeats,
+        DateTime requestedAt,
         DateTime promotedAt,
         List<EntityEntry> trackedEntries,
         CancellationToken ct)
     {
-        var today = DateOnly.FromDateTime(promotedAt);
+        var requestDate = DateOnly.FromDateTime(requestedAt);
         foreach (var request in waiting)
         {
             // решение: сохраняем FIFO и продвигаем заявку целиком, поэтому при нехватке мест останавливаемся.
@@ -136,7 +139,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
 
             var pass = passesByUser[request.UserId];
             trackedEntries.Add(unitOfWork.DbContext.Attach(request));
-            if (pass.ValidUntil < today || pass.RemainingVisits < request.Seats)
+            if (pass.ValidUntil < requestDate || pass.RemainingVisits < request.Seats)
             {
                 // решение: закрываем заявку без брони, чтобы непригодный абонемент не задерживал очередь.
                 request.Status = WaitlistStatus.Closed;
@@ -246,7 +249,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
                 trackedEntries.Add(unitOfWork.DbContext.Attach(pass));
                 enrollment.Seats = seats;
                 pass.RemainingVisits = (int)remainingVisits;
-                await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, changedAt, trackedEntries, ct);
+                await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, requestedAt, changedAt, trackedEntries, ct);
                 await unitOfWork.SaveChangesAsync(ct);
             }
             finally
