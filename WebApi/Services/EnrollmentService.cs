@@ -95,24 +95,32 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
                     return new ChangeSeatsResult.Conflict(reason);
             }
 
-            await SaveSeatChangeAsync(enrollment, pass, seats, seatDelta, ct);
+            var remainingVisits = (long)pass.RemainingVisits - seatDelta;
+            // решение: отклоняем возврат целиком, если новый остаток не помещается в int.
+            if (remainingVisits > int.MaxValue)
+                return new ChangeSeatsResult.Conflict("pass-balance-overflow");
+
+            await SaveSeatChangeAsync(enrollment, pass, seats, (int)remainingVisits, ct);
         }
 
         var details = await GetDetailsAsync(enrollmentId, userId, ct)
             ?? throw new InvalidOperationException("The locked enrollment must have details.");
+        if (HasStarted(activity))
+            return new ChangeSeatsResult.Conflict("class-started");
+
         await transaction.CommitAsync(ct);
         return new ChangeSeatsResult.Success(details);
     }
 
     private async Task SaveSeatChangeAsync(
-        Enrollment enrollment, Pass pass, int seats, int seatDelta, CancellationToken ct)
+        Enrollment enrollment, Pass pass, int seats, int remainingVisits, CancellationToken ct)
     {
         var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
         var passEntry = unitOfWork.DbContext.Attach(pass);
         try
         {
             enrollment.Seats = seats;
-            pass.RemainingVisits -= seatDelta;
+            pass.RemainingVisits = remainingVisits;
             await unitOfWork.SaveChangesAsync(ct);
         }
         finally

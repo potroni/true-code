@@ -339,6 +339,36 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    [DataRow(int.MaxValue, HttpStatusCode.Conflict)]
+    [DataRow(int.MaxValue - 1, HttpStatusCode.OK)]
+    public async Task ChangeSeatsChecksTheBalanceLimitWhenReturningVisits(int visits, HttpStatusCode expectedStatus)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 4);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+
+        using var response = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 1 });
+
+        Assert.AreEqual(expectedStatus, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        if (expectedStatus == HttpStatusCode.Conflict)
+        {
+            Assert.AreEqual("pass-balance-overflow", body.GetProperty("reason").GetString());
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: int.MaxValue);
+        }
+        else
+        {
+            Assert.AreEqual(int.MaxValue, body.GetProperty("pass").GetProperty("remainingVisits").GetInt32());
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 1, visits: int.MaxValue);
+        }
+    }
+
+    [TestMethod]
     public async Task CreateUsesJwtIdentityAndReturnsTheCreatedContract()
     {
         var service = new EnrollmentServiceStub();
@@ -1144,6 +1174,45 @@ public class EnrollmentHttpContractTests
             Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
         else
             Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+
+        var pending = client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats }, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 1, ct);
+            clock.SetUtcNow(now.AddDays(1));
+            await gate.CommitAsync(ct);
+
+            using var response = await pending;
+            Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+            Assert.AreEqual("class-started", problem.GetProperty("reason").GetString());
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 1);
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+        }
+    }
+
+    [TestMethod]
+    [DataRow(1)]
+    [DataRow(3)]
+    public async Task SeatChangeRollsBackIfClassStartsWhileUpdateWaits(int seats)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        await db.Database.ExecuteSqlRawAsync("LOCK TABLE enrollments IN SHARE MODE", ct);
 
         var pending = client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats }, ct);
         try
