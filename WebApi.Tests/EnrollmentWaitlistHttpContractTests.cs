@@ -223,8 +223,6 @@ public partial class EnrollmentHttpContractTests
     [DataRow("{", "key")]
     [DataRow("""{"seats":1}""", "key")]
     [DataRow("""{"classId":42}""", "key")]
-    [DataRow("""{"classId":0,"seats":1}""", "key")]
-    [DataRow("""{"classId":-1,"seats":1}""", "key")]
     [DataRow("""{"classId":"42","seats":1}""", "key")]
     [DataRow("""{"classId":9223372036854775808,"seats":1}""", "key")]
     [DataRow("""{"classId":42,"seats":0}""", "key")]
@@ -432,39 +430,64 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    [DataRow("missing", 1, HttpStatusCode.NotFound, null)]
+    [DataRow(0L)]
+    [DataRow(-1L)]
+    [DataRow(long.MaxValue)]
+    public async Task JoinWaitlistReturnsNotFoundForMissingNumericClassId(long classId)
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
+        var key = Guid.NewGuid().ToString("N");
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var request = CreateWaitlistJoin(classId, seats: 1, key);
+        using var response = await client.SendAsync(request);
+
+        Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.IsFalse(await db.Set<IdempotencyEntry>().AnyAsync(entry => entry.OriginalKey == key));
+    }
+
+    [TestMethod]
     [DataRow("cancelled", 3, HttpStatusCode.Conflict, "class-cancelled")]
     [DataRow("started", 3, HttpStatusCode.Conflict, "class-started")]
     [DataRow("upcoming", 3, HttpStatusCode.Conflict, "seats-exceed-capacity")]
     [DataRow("upcoming", 1, HttpStatusCode.Conflict, "seats-available")]
-    public async Task JoinWaitlistRejectsUnavailableRequests(string state, int seats, HttpStatusCode status, string? reason)
+    [DataRow("upcoming", 2, HttpStatusCode.Created, null)]
+    public async Task JoinWaitlistChecksClassStateAndFreeSeats(string state, int seats, HttpStatusCode status, string? reason)
     {
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
         await using var factory = new FixedTimeApplicationFactory(now);
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
         var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
-        var classId = long.MaxValue;
-        if (state != "missing")
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        var activity = await db.Set<Class>().SingleAsync(row => row.Id == classId);
+        if (state == "started")
+            activity.StartsAt = now.UtcDateTime;
+        activity.IsCancelled = state == "cancelled";
+        db.Add(new Enrollment
         {
-            classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
-            var activity = await db.Set<Class>().SingleAsync(row => row.Id == classId);
-            if (state == "started")
-                activity.StartsAt = now.UtcDateTime;
-            activity.IsCancelled = state == "cancelled";
-            db.Add(new Enrollment
-            {
-                ClassId = classId, UserId = userId,
-                Seats = 1, CreatedAt = now.UtcDateTime, Status = "active"
-            });
-            await db.SaveChangesAsync();
-        }
+            ClassId = classId, UserId = userId,
+            Seats = 1, CreatedAt = now.UtcDateTime, Status = "active"
+        });
+        await db.SaveChangesAsync();
         var key = Guid.NewGuid().ToString("N");
         using var client = CreateAuthenticatedClient(factory, userId);
         using var request = CreateRequest($$"""{"classId":{{classId}},"seats":{{seats}}}""", key, WaitlistPath);
         using var response = await client.SendAsync(request);
 
         Assert.AreEqual(status, response.StatusCode);
+        if (status == HttpStatusCode.Created)
+        {
+            var result = await response.Content.ReadFromJsonAsync<JoinWaitlistResponse>();
+            Assert.IsNotNull(result);
+            Assert.AreEqual((classId, seats, 1), (result.ClassId, result.Seats, result.Position));
+            var waiting = await db.Set<WaitlistEntry>().SingleAsync(entry => entry.ClassId == classId);
+            Assert.AreEqual((result.Id, userId, seats, WaitlistStatus.Waiting),
+                (waiting.Id, waiting.UserId, waiting.Seats, waiting.Status));
+            return;
+        }
         if (reason is not null)
         {
             var problem = await response.Content.ReadFromJsonAsync<JsonElement>();

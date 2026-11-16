@@ -163,27 +163,42 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task WaitlistJoinRollsBackWhenJournalSaveFailsAndSameKeyCanRetry()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task WaitlistJoinRollsBackAfterJournalSaveAndSameKeyCanRetry(bool classStarts)
     {
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
         var key = Guid.NewGuid().ToString("N");
-        var failure = new WaitlistJournalSaveFailure(key);
-        await using var factory = new FixedTimeApplicationFactory(new AdjustableTimeProvider(now), failure);
+        DateTime startsAt = default;
+        var interceptor = new WaitlistJournalSavedInterceptor(key, () =>
+        {
+            if (classStarts)
+                clock.SetUtcNow(new DateTimeOffset(startsAt, TimeSpan.Zero));
+            else
+                throw new InvalidOperationException("Simulated failure after saving the waitlist journal.");
+        });
+        await using var factory = new FixedTimeApplicationFactory(clock, interceptor);
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
         var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
         var candidate = await AddBookingClientAsync(db, now.UtcDateTime, visits: 2);
         var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        startsAt = await db.Set<Class>().Where(row => row.Id == classId).Select(row => row.StartsAt).SingleAsync();
         await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
         using var client = CreateAuthenticatedClient(factory, candidate);
 
         using var firstRequest = CreateWaitlistJoin(classId, seats: 2, key);
         using var failed = await client.SendAsync(firstRequest);
-        Assert.AreEqual(HttpStatusCode.InternalServerError, failed.StatusCode);
-        Assert.IsTrue(failure.WasTriggered);
+        if (classStarts)
+            await AssertWaitlistConflictAsync(failed, "class-started", CancellationToken.None);
+        else
+            Assert.AreEqual(HttpStatusCode.InternalServerError, failed.StatusCode);
+        Assert.IsTrue(interceptor.WasTriggered);
         Assert.IsFalse(await db.Set<WaitlistEntry>().AnyAsync(row => row.ClassId == classId));
         Assert.IsFalse(await db.Set<IdempotencyEntry>().AnyAsync(row => row.OriginalKey == key));
 
+        clock.SetUtcNow(now);
         using var retryRequest = CreateWaitlistJoin(classId, seats: 2, key);
         using var retry = await client.SendAsync(retryRequest);
         Assert.AreEqual(HttpStatusCode.Created, retry.StatusCode);
@@ -299,7 +314,7 @@ public partial class EnrollmentHttpContractTests
         Assert.AreEqual(reason, problem.GetProperty("reason").GetString());
     }
 
-    private sealed class WaitlistJournalSaveFailure(string key) : SaveChangesInterceptor
+    private sealed class WaitlistJournalSavedInterceptor(string key, Action onSaved) : SaveChangesInterceptor
     {
         public bool WasTriggered { get; private set; }
 
@@ -311,7 +326,7 @@ public partial class EnrollmentHttpContractTests
                     && entry.Entity.OriginalKey == key))
             {
                 WasTriggered = true;
-                throw new InvalidOperationException("Simulated failure after saving the waitlist journal.");
+                onSaved();
             }
 
             return base.SavedChangesAsync(eventData, result, cancellationToken);

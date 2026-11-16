@@ -55,30 +55,31 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             () => JoinWaitlistUnderClassLockAsync(userId, classId, seats, ct),
             ct);
 
-    private async Task<(JoinWaitlistResult Result, string? ResponseBody)> JoinWaitlistUnderClassLockAsync(
+    private async Task<(JoinWaitlistResult Result, string? ResponseBody, Func<JoinWaitlistResult?>? ValidateBeforeCommit)>
+        JoinWaitlistUnderClassLockAsync(
         long userId, long classId, int seats, CancellationToken ct)
     {
         var activity = await unitOfWork.Class.LockByIdAsync(classId, ct);
         if (activity is null)
-            return (new JoinWaitlistResult.ClassNotFound(), null);
+            return (new JoinWaitlistResult.ClassNotFound(), null, null);
         if (activity.IsCancelled)
-            return (new JoinWaitlistResult.Conflict("class-cancelled"), null);
+            return (new JoinWaitlistResult.Conflict("class-cancelled"), null, null);
         if (HasStarted(activity))
-            return (new JoinWaitlistResult.Conflict("class-started"), null);
+            return (new JoinWaitlistResult.Conflict("class-started"), null, null);
 
         // решение: проверяем действующую заявку раньше вместимости, чтобы сообщить о ней даже при свободных местах.
         if (await unitOfWork.Waitlist.HasWaitingAsync(classId, userId, ct))
-            return (new JoinWaitlistResult.Conflict("already-waiting"), null);
+            return (new JoinWaitlistResult.Conflict("already-waiting"), null, null);
         // решение: отклоняем заявки, которые невозможно продвинуть целиком даже на пустое занятие.
         if (seats > activity.Capacity)
-            return (new JoinWaitlistResult.Conflict("seats-exceed-capacity"), null);
+            return (new JoinWaitlistResult.Conflict("seats-exceed-capacity"), null, null);
 
         var occupiedSeats = await unitOfWork.Enrollment.SumActiveSeatsAsync(classId, ct);
         var createdAt = timeProvider.GetUtcNow().UtcDateTime;
         if (activity.StartsAt <= createdAt)
-            return (new JoinWaitlistResult.Conflict("class-started"), null);
+            return (new JoinWaitlistResult.Conflict("class-started"), null, null);
         if (activity.Capacity - occupiedSeats >= seats)
-            return (new JoinWaitlistResult.Conflict("seats-available"), null);
+            return (new JoinWaitlistResult.Conflict("seats-available"), null, null);
 
         var entry = new WaitlistEntry
         {
@@ -94,17 +95,17 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         {
             await unitOfWork.SaveChangesAsync(ct);
             var position = 1 + await unitOfWork.Waitlist.CountWaitingAheadAsync(entry, ct);
-            if (HasStarted(activity))
-                return (new JoinWaitlistResult.Conflict("class-started"), null);
-
             var response = new JoinWaitlistResponse(entry.Id, entry.ClassId, entry.Seats, position, entry.CreatedAt);
             var body = JsonSerializer.Serialize(response, JsonSerializerOptions.Web);
-            return (new JoinWaitlistResult.Success(body), body);
+            return (new JoinWaitlistResult.Success(body), body, RejectIfStarted);
         }
         finally
         {
             unitOfWork.DbContext.Entry(entry).State = EntityState.Detached;
         }
+
+        JoinWaitlistResult? RejectIfStarted() =>
+            HasStarted(activity) ? new JoinWaitlistResult.Conflict("class-started") : null;
     }
 
     public async Task<CancelWaitlistResult> CancelWaitlistAsync(long id, long userId, CancellationToken ct)
@@ -397,10 +398,10 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             {
                 var (pass, rejection) = await CheckAvailabilityUnderLocksAsync(userId, classId, seats, requestedAt, ct);
                 if (rejection is not null)
-                    return (rejection, null);
+                    return (rejection, null, null);
 
                 var body = await SaveEnrollmentAsync(pass!, userId, classId, seats, requestedAt, ct);
-                return (new CreateEnrollmentResult.Success(body), body);
+                return (new CreateEnrollmentResult.Success(body), body, null);
             },
             ct);
     }
@@ -408,7 +409,8 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
     private async Task<TResult> ExecuteIdempotentAsync<TResult>(
         long userId, IdempotencyOperation operation, string key, long classId, int seats,
         Func<IdempotencyLookup, TResult> toExistingResult,
-        Func<Task<(TResult Result, string? ResponseBody)>> execute, CancellationToken ct)
+        Func<Task<(TResult Result, string? ResponseBody, Func<TResult?>? ValidateBeforeCommit)>> execute,
+        CancellationToken ct) where TResult : class
     {
         await using var transaction = await unitOfWork.DbContext.Database
             .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
@@ -419,7 +421,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         if (lookup.Status != IdempotencyLookupStatus.Missing)
             return toExistingResult(lookup);
 
-        var (result, responseBody) = await execute();
+        var (result, responseBody, validateBeforeCommit) = await execute();
         if (responseBody is null)
             return result;
 
@@ -437,6 +439,13 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             await transaction.RollbackAsync(ct);
             unitOfWork.DbContext.ChangeTracker.Clear();
             return toExistingResult(await FindJournalEntryAsync());
+        }
+
+        if (validateBeforeCommit?.Invoke() is { } rejection)
+        {
+            await transaction.RollbackAsync(ct);
+            unitOfWork.DbContext.ChangeTracker.Clear();
+            return rejection;
         }
 
         await transaction.CommitAsync(ct);
