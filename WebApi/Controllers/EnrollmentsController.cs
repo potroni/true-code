@@ -10,9 +10,10 @@ namespace WebApi.Controllers;
 public sealed class EnrollmentsController(IEnrollmentService enrollmentService) : BaseApiController
 {
     [HttpPost]
-    [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType<EnrollmentResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(StatusCodes.Status501NotImplemented)]
     public async Task<ActionResult<EnrollmentResponse>> Create(
@@ -20,11 +21,20 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
         CancellationToken ct)
     {
-        var enrollment = await enrollmentService.CreateAsync(
+        var result = await enrollmentService.CreateAsync(
             CurrentUserId, request.ClassId, request.Seats, idempotencyKey, ct);
 
-        return enrollment is null
-            ? Problem(statusCode: StatusCodes.Status501NotImplemented)
-            : StatusCode(StatusCodes.Status201Created, enrollment);
+        return result switch
+        {
+            CreateEnrollmentResult.Success success => new ContentResult
+            {
+                Content = success.ResponseBody,
+                ContentType = "application/json; charset=utf-8",
+                StatusCode = StatusCodes.Status201Created
+            },
+            CreateEnrollmentResult.KeyConflict => ConflictWithReason("idempotency-key-conflict"),
+            CreateEnrollmentResult.NotImplemented => Problem(statusCode: StatusCodes.Status501NotImplemented),
+            _ => throw new InvalidOperationException("Unexpected enrollment result.")
+        };
     }
 }

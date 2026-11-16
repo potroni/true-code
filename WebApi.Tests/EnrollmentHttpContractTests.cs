@@ -4,8 +4,10 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using DataAccessLayer.Entities;
+using DataAccessLayer.UnitOfWork;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using WebApi.Auth;
@@ -116,11 +118,107 @@ public class EnrollmentHttpContractTests
         Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
     }
 
-    private static HttpClient CreateAuthenticatedClient(ApiApplicationFactory factory)
+    [TestMethod]
+    public async Task CreateReplaysStoredJsonAndRejectsChangedParameters()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var userId = await unitOfWork.DbContext.Set<User>().Select(user => user.Id).FirstAsync();
+        var classId = await unitOfWork.DbContext.Set<Class>().Select(activity => activity.Id).FirstAsync();
+        var key = Guid.NewGuid().ToString("N");
+        var storedBody =
+            $$"""{"status":"active", "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}""";
+
+        await using (var transaction = await unitOfWork.DbContext.Database.BeginTransactionAsync())
+        {
+            unitOfWork.Idempotency.AddSuccess(
+                userId, IdempotencyOperation.CreateEnrollment, key, classId, 2, storedBody);
+            await unitOfWork.SaveChangesAsync();
+            await transaction.CommitAsync();
+        }
+
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var replay = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", key);
+        using var replayResponse = await client.SendAsync(replay);
+        Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
+        Assert.AreEqual("application/json", replayResponse.Content.Headers.ContentType?.MediaType);
+        Assert.AreEqual(storedBody, await replayResponse.Content.ReadAsStringAsync());
+
+        foreach (var body in new[]
+        {
+            $$"""{"classId":{{classId}},"seats":1}""",
+            """{"classId":9223372036854775807,"seats":2}"""
+        })
+        {
+            using var conflict = CreateRequest(body, key);
+            using var conflictResponse = await client.SendAsync(conflict);
+            Assert.AreEqual(HttpStatusCode.Conflict, conflictResponse.StatusCode);
+            Assert.AreEqual("application/problem+json", conflictResponse.Content.Headers.ContentType?.MediaType);
+            var problem = await conflictResponse.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.AreEqual("idempotency-key-conflict", problem.GetProperty("reason").GetString());
+        }
+
+        Assert.AreEqual(1, await unitOfWork.DbContext.Set<IdempotencyEntry>()
+            .CountAsync(entry => entry.OriginalKey == key));
+    }
+
+    [TestMethod]
+    public async Task CreateWaitsForKeyLockAndReplaysResponseAfterCommit()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
+        var classId = await db.Set<Class>().Select(activity => activity.Id).FirstAsync();
+        var key = Guid.NewGuid().ToString("N");
+        var storedBody =
+            $$"""{"status":"active", "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}""";
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var request = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", key);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        const IdempotencyOperation operation = IdempotencyOperation.CreateEnrollment;
+        await unitOfWork.Idempotency.LockAsync(userId, operation, key, ct);
+        unitOfWork.Idempotency.AddSuccess(userId, operation, key, classId, 2, storedBody);
+        await unitOfWork.SaveChangesAsync(ct);
+
+        var pendingResponse = client.SendAsync(request, ct);
+        try
+        {
+            while (!await db.Database.SqlQueryRaw<bool>(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_locks
+                    WHERE locktype = 'advisory' AND NOT granted
+                        AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                ) AS "Value"
+                """).SingleAsync(ct))
+            {
+                Assert.IsFalse(pendingResponse.IsCompleted, "The HTTP request did not wait for the key lock.");
+                await Task.Delay(20, ct);
+            }
+
+            await transaction.CommitAsync(ct);
+            using var response = await pendingResponse;
+            Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
+            Assert.AreEqual(storedBody, await response.Content.ReadAsStringAsync(ct));
+        }
+        finally
+        {
+            if (!pendingResponse.IsCompleted)
+                await timeout.CancelAsync();
+        }
+    }
+
+    private static HttpClient CreateAuthenticatedClient(ApiApplicationFactory factory, long userId = UserId)
     {
         var client = factory.CreateClient();
         var token = factory.Services.GetRequiredService<AccessTokenService>()
-            .Create(new User { Id = UserId, Email = "client@club.test", Role = "user" });
+            .Create(new User { Id = userId, Email = "client@club.test", Role = "user" });
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.AccessToken);
         return client;
     }
@@ -157,11 +255,13 @@ public class EnrollmentHttpContractTests
 
         public (long UserId, long ClassId, int Seats, string Key)? Arguments { get; private set; }
 
-        public Task<EnrollmentResponse?> CreateAsync(
+        public Task<CreateEnrollmentResult> CreateAsync(
             long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
         {
             Arguments = (userId, classId, seats, idempotencyKey);
-            return Task.FromResult<EnrollmentResponse?>(new(123, classId, seats, "active", CreatedAt));
+            var response = new EnrollmentResponse(123, classId, seats, "active", CreatedAt);
+            var body = JsonSerializer.Serialize(response, JsonSerializerOptions.Web);
+            return Task.FromResult<CreateEnrollmentResult>(new CreateEnrollmentResult.Success(body));
         }
     }
 }
