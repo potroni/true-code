@@ -37,6 +37,33 @@ public class ClassRepository : GenericRepository<Class>, IClassRepository
             .FirstOrDefaultAsync(x => x.Id == id, ct);
     }
 
+    public IQueryable<Class> QueryClassesForLoad(DateOnly from, DateOnly to, long? roomId)
+    {
+        var fromUtc = from.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        // решение: задаем минимальную границу литералом, чтобы Npgsql не передал ее как -infinity.
+        var classes = from == DateOnly.MinValue
+            ? _dbSet.FromSqlRaw("SELECT * FROM classes WHERE starts_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00'")
+            : _dbSet.Where(x => x.StartsAt >= fromUtc);
+
+        if (to < DateOnly.MaxValue)
+        {
+            var untilUtc = to.AddDays(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+            classes = classes.Where(x => x.StartsAt < untilUtc);
+        }
+        else
+        {
+            // решение: используем последнюю хранимую микросекунду, так как следующая полночь вне диапазона DateTime.
+            var lastMicrosecondUtc = to.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)
+                .AddTicks(TimeSpan.TicksPerDay - TimeSpan.TicksPerMicrosecond);
+            classes = classes.Where(x => x.StartsAt <= lastMicrosecondUtc);
+        }
+
+        if (roomId is long room)
+            classes = classes.Where(x => x.RoomId == room);
+
+        return classes.AsNoTracking();
+    }
+
     public Task<List<ScheduleRow>> GetScheduleRowsAsync(DateTime from, DateTime to, long? roomId, long userId,
         (DateTime StartsAt, long ClassId)? after, int take, CancellationToken ct = default)
     {
