@@ -130,6 +130,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         var today = DateOnly.FromDateTime(promotedAt);
         foreach (var request in waiting)
         {
+            // решение: сохраняем FIFO и продвигаем заявку целиком, поэтому при нехватке мест останавливаемся.
             if (request.Seats > availableSeats)
                 break;
 
@@ -137,6 +138,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             trackedEntries.Add(unitOfWork.DbContext.Attach(request));
             if (pass.ValidUntil < today || pass.RemainingVisits < request.Seats)
             {
+                // решение: закрываем заявку без брони, чтобы непригодный абонемент не задерживал очередь.
                 request.Status = WaitlistStatus.Closed;
                 continue;
             }
