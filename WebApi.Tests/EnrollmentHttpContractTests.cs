@@ -454,6 +454,51 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    [DataRow(1, 0, WaitlistStatus.Promoted)]
+    [DataRow(2, 1, WaitlistStatus.Waiting)]
+    [DataRow(3, 0, WaitlistStatus.Waiting)]
+    public async Task ChangeSeatsPromotesOnlyAfterReductionAndReturnsTheFinalBalance(
+        int seats, int remainingVisits, WaitlistStatus expectedStatus)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 5);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        var request = new WaitlistEntry
+        {
+            ClassId = classId, UserId = userId, Seats = 2, CreatedAt = now.UtcDateTime
+        };
+        db.Add(request);
+        await db.SaveChangesAsync();
+        using var client = CreateAuthenticatedClient(factory, userId);
+
+        using var response = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats });
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var details = await response.Content.ReadFromJsonAsync<EnrollmentDetailsResponse>();
+        Assert.IsNotNull(details);
+        Assert.AreEqual((booking.Id, seats, remainingVisits), (details.Id, details.Seats, details.Pass.RemainingVisits));
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats, remainingVisits);
+        var persistedRequest = await db.Set<WaitlistEntry>().AsNoTracking().SingleAsync(x => x.Id == request.Id);
+        Assert.AreEqual(expectedStatus, persistedRequest.Status);
+
+        var otherBookings = await db.Set<Enrollment>().AsNoTracking()
+            .Where(x => x.ClassId == classId && x.Id != booking.Id).ToArrayAsync();
+        if (expectedStatus == WaitlistStatus.Promoted)
+        {
+            var promoted = otherBookings.Single();
+            Assert.AreEqual((userId, 2, "active"), (promoted.UserId, promoted.Seats, promoted.Status));
+        }
+        else
+        {
+            Assert.AreEqual(0, otherBookings.Length);
+        }
+    }
+
+    [TestMethod]
     public async Task CreateUsesJwtIdentityAndReturnsTheCreatedContract()
     {
         var service = new EnrollmentServiceStub();

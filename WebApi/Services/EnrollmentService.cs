@@ -196,7 +196,11 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         var seatDelta = seats - enrollment.Seats;
         if (seatDelta != 0)
         {
-            var pass = await LockPassAsync(userId, ct);
+            var waiting = seatDelta < 0 ? await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct) : [];
+            var passUserIds = waiting.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
+            var passes = await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
+            var passesByUser = passes.ToDictionary(x => x.UserId);
+            var pass = passesByUser[userId];
             if (HasStarted(activity))
                 return new ChangeSeatsResult.Conflict("class-started");
 
@@ -212,7 +216,28 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             if (remainingVisits > int.MaxValue)
                 return new ChangeSeatsResult.Conflict("pass-balance-overflow");
 
-            await SaveSeatChangeAsync(enrollment, pass, seats, (int)remainingVisits, ct);
+            var availableSeats = waiting.Count == 0
+                ? 0
+                : activity.Capacity - await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct) - seatDelta;
+            var changedAt = timeProvider.GetUtcNow().UtcDateTime;
+            if (activity.StartsAt <= changedAt)
+                return new ChangeSeatsResult.Conflict("class-started");
+
+            var trackedEntries = new List<EntityEntry>();
+            try
+            {
+                trackedEntries.Add(unitOfWork.DbContext.Attach(enrollment));
+                trackedEntries.Add(unitOfWork.DbContext.Attach(pass));
+                enrollment.Seats = seats;
+                pass.RemainingVisits = (int)remainingVisits;
+                await PromoteWaitlistAsync(waiting, passesByUser, availableSeats, changedAt, trackedEntries, ct);
+                await unitOfWork.SaveChangesAsync(ct);
+            }
+            finally
+            {
+                foreach (var entry in trackedEntries)
+                    entry.State = EntityState.Detached;
+            }
         }
 
         var details = await GetDetailsAsync(enrollmentId, userId, ct)
@@ -222,24 +247,6 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
 
         await transaction.CommitAsync(ct);
         return new ChangeSeatsResult.Success(details);
-    }
-
-    private async Task SaveSeatChangeAsync(
-        Enrollment enrollment, Pass pass, int seats, int remainingVisits, CancellationToken ct)
-    {
-        var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
-        var passEntry = unitOfWork.DbContext.Attach(pass);
-        try
-        {
-            enrollment.Seats = seats;
-            pass.RemainingVisits = remainingVisits;
-            await unitOfWork.SaveChangesAsync(ct);
-        }
-        finally
-        {
-            enrollmentEntry.State = EntityState.Detached;
-            passEntry.State = EntityState.Detached;
-        }
     }
 
     public async Task<CreateEnrollmentResult> CreateAsync(
