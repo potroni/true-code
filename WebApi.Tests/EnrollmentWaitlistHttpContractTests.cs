@@ -16,6 +16,77 @@ public partial class EnrollmentHttpContractTests
     private const string WaitlistPath = "/enrollments/waitlist";
 
     [TestMethod]
+    public async Task CancellingBookingThroughApiPromotesFirstWaitlistedClientAndDebitsOnce()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 2);
+        var firstUser = await AddBookingClientAsync(db, now.UtcDateTime, visits: 4);
+        var secondUser = await AddBookingClientAsync(db, now.UtcDateTime, visits: 4);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        using var ownerClient = CreateAuthenticatedClient(factory, owner);
+        using var firstClient = CreateAuthenticatedClient(factory, firstUser);
+        using var secondClient = CreateAuthenticatedClient(factory, secondUser);
+
+        using var bookingRequest = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", Guid.NewGuid().ToString("N"));
+        using var bookingResponse = await ownerClient.SendAsync(bookingRequest);
+        Assert.AreEqual(HttpStatusCode.Created, bookingResponse.StatusCode);
+        var booking = await bookingResponse.Content.ReadFromJsonAsync<EnrollmentResponse>();
+        Assert.IsNotNull(booking);
+        var firstKey = Guid.NewGuid().ToString("N");
+        using var firstJoinRequest = CreateWaitlistJoin(classId, seats: 2, firstKey);
+        using var firstJoin = await firstClient.SendAsync(firstJoinRequest);
+        Assert.AreEqual(HttpStatusCode.Created, firstJoin.StatusCode);
+        var firstBody = await firstJoin.Content.ReadAsStringAsync();
+        var first = JsonSerializer.Deserialize<JoinWaitlistResponse>(firstBody, JsonSerializerOptions.Web);
+        Assert.IsNotNull(first);
+        Assert.AreEqual(1, first.Position);
+        using var secondJoinRequest = CreateWaitlistJoin(classId, seats: 1, Guid.NewGuid().ToString("N"));
+        using var secondJoin = await secondClient.SendAsync(secondJoinRequest);
+        Assert.AreEqual(HttpStatusCode.Created, secondJoin.StatusCode);
+        var second = await secondJoin.Content.ReadFromJsonAsync<JoinWaitlistResponse>();
+        Assert.IsNotNull(second);
+        Assert.AreEqual(2, second.Position);
+
+        var entries = await db.Set<WaitlistEntry>().AsNoTracking().Where(row => row.ClassId == classId)
+            .ToDictionaryAsync(row => row.Id);
+        await AssertPromotionAsync(db, entries[first.Id], WaitlistStatus.Waiting, visits: 4);
+        await AssertPromotionAsync(db, entries[second.Id], WaitlistStatus.Waiting, visits: 4);
+
+        var cancelPath = $"/enrollments/{booking.Id}/cancel";
+        using var cancellation = await ownerClient.PostAsync(cancelPath, null);
+        Assert.AreEqual(HttpStatusCode.OK, cancellation.StatusCode);
+        var cancelled = await cancellation.Content.ReadFromJsonAsync<CancelEnrollmentResponse>();
+        Assert.IsNotNull(cancelled);
+        Assert.AreEqual((booking.Id, "cancelled", 2), (cancelled.Id, cancelled.Status, cancelled.RefundedVisits));
+        var active = await db.Set<Enrollment>().SingleAsync(row => row.ClassId == classId && row.Status == "active");
+        Assert.AreEqual(firstUser, active.UserId);
+        using var detailsResponse = await firstClient.GetAsync($"/enrollments/{active.Id}");
+        Assert.AreEqual(HttpStatusCode.OK, detailsResponse.StatusCode);
+        var details = await detailsResponse.Content.ReadFromJsonAsync<EnrollmentDetailsResponse>();
+        Assert.IsNotNull(details);
+        Assert.AreEqual((active.Id, classId, 2, "active", 2),
+            (details.Id, details.Class.Id, details.Seats, details.Status, details.Pass.RemainingVisits));
+
+        using var repeatCancellation = await ownerClient.PostAsync(cancelPath, null);
+        Assert.AreEqual(HttpStatusCode.OK, repeatCancellation.StatusCode);
+        Assert.AreEqual(await cancellation.Content.ReadAsStringAsync(),
+            await repeatCancellation.Content.ReadAsStringAsync());
+
+        using var replayRequest = CreateWaitlistJoin(classId, seats: 2, firstKey);
+        using var replay = await firstClient.SendAsync(replayRequest);
+        Assert.AreEqual(HttpStatusCode.Created, replay.StatusCode);
+        Assert.AreEqual(firstBody, await replay.Content.ReadAsStringAsync());
+
+        Assert.AreEqual(2, await db.Set<Pass>().Where(row => row.UserId == owner)
+            .Select(row => row.RemainingVisits).SingleAsync());
+        await AssertPromotionAsync(db, entries[first.Id], WaitlistStatus.Promoted, visits: 2);
+        await AssertPromotionAsync(db, entries[second.Id], WaitlistStatus.Waiting, visits: 4);
+    }
+
+    [TestMethod]
     public async Task CancelWaitlistUsesJwtIdentityAndRequiresNeitherBodyNorKey()
     {
         var service = new EnrollmentServiceStub
