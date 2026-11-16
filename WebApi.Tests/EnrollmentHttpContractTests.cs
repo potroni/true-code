@@ -137,6 +137,101 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    public async Task ChangeSeatsUsesJwtIdentityAndReturnsTheBookingCard()
+    {
+        var details = new EnrollmentDetailsResponse(42, "active", 2, EnrollmentServiceStub.CreatedAt,
+            new EnrollmentClassResponse(10, "Yoga", EnrollmentServiceStub.CreatedAt.AddDays(1), 60,
+                false, new EnrollmentRoomResponse(5, "Studio")),
+            new EnrollmentPassResponse(3, new DateOnly(2026, 11, 17)));
+        var service = new EnrollmentServiceStub { SeatChangeResult = new ChangeSeatsResult.Success(details) };
+        using var factory = new EnrollmentApplicationFactory(service);
+        using var client = CreateAuthenticatedClient(factory);
+        using var response = await client.PostAsJsonAsync("/enrollments/42/seats?userId=99", new { seats = 2 });
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        Assert.AreEqual((42L, UserId, 2), service.SeatChangeArguments);
+        Assert.AreEqual(details, await response.Content.ReadFromJsonAsync<EnrollmentDetailsResponse>());
+    }
+
+    [TestMethod]
+    [DataRow("0", """{"seats":2}""")]
+    [DataRow("invalid", """{"seats":2}""")]
+    [DataRow("42", null)]
+    [DataRow("42", "null")]
+    [DataRow("42", "{}")]
+    [DataRow("42", """{"seats":0}""")]
+    [DataRow("42", """{"seats":"2"}""")]
+    [DataRow("42", """{"seats":1.5}""")]
+    [DataRow("42", """{"seats":2147483648}""")]
+    public async Task ChangeSeatsRejectsInvalidInputBeforeCallingTheService(string id, string? body)
+    {
+        var service = new EnrollmentServiceStub();
+        using var factory = new EnrollmentApplicationFactory(service);
+        using var client = CreateAuthenticatedClient(factory);
+        using var content = body is null ? null : new StringContent(body, Encoding.UTF8, "application/json");
+        using var response = await client.PostAsync($"/enrollments/{id}/seats", content);
+
+        Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.IsNull(service.SeatChangeArguments);
+    }
+
+    [TestMethod]
+    [DataRow(null, HttpStatusCode.NotFound)]
+    [DataRow("capacity-exceeded", HttpStatusCode.Conflict)]
+    [DataRow("pass-exhausted", HttpStatusCode.Conflict)]
+    [DataRow("pass-expired", HttpStatusCode.Conflict)]
+    [DataRow("class-started", HttpStatusCode.Conflict)]
+    [DataRow("class-cancelled", HttpStatusCode.Conflict)]
+    [DataRow("enrollment-cancelled", HttpStatusCode.Conflict)]
+    public async Task ChangeSeatsMapsServiceRejections(string? reason, HttpStatusCode status)
+    {
+        var service = new EnrollmentServiceStub
+        {
+            SeatChangeResult = reason is null ? new ChangeSeatsResult.NotFound() : new ChangeSeatsResult.Conflict(reason)
+        };
+        using var factory = new EnrollmentApplicationFactory(service);
+        using var client = CreateAuthenticatedClient(factory);
+        using var response = await client.PostAsJsonAsync("/enrollments/42/seats", new { seats = 2 });
+
+        Assert.AreEqual(status, response.StatusCode);
+        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual((int)status, problem.GetProperty("status").GetInt32());
+        if (reason is not null)
+            Assert.AreEqual(reason, problem.GetProperty("reason").GetString());
+    }
+
+    [TestMethod]
+    public async Task ChangeSeatsRequiresJwt()
+    {
+        var service = new EnrollmentServiceStub();
+        using var factory = new EnrollmentApplicationFactory(service);
+        using var client = factory.CreateClient();
+        using var response = await client.PostAsJsonAsync("/enrollments/42/seats", new { seats = 2 });
+
+        Assert.AreEqual(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.IsNull(service.SeatChangeArguments);
+    }
+
+    [TestMethod]
+    public async Task ChangeSeatsDocumentsItsContractInOpenApi()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var operation = document.GetProperty("paths").GetProperty("/enrollments/{id}/seats").GetProperty("post");
+        Assert.IsTrue(operation.GetProperty("requestBody").GetProperty("required").GetBoolean());
+
+        var responses = operation.GetProperty("responses");
+        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429" },
+            responses.EnumerateObject().Select(response => response.Name).ToArray());
+        var schema = responses.GetProperty("200").GetProperty("content")
+            .GetProperty("application/json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/EnrollmentDetailsResponse", schema.GetProperty("$ref").GetString());
+    }
+
+    [TestMethod]
     public async Task CreateUsesJwtIdentityAndReturnsTheCreatedContract()
     {
         var service = new EnrollmentServiceStub();
@@ -221,7 +316,7 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task GetDetailsSharesTheBusinessRateLimitWithCreate()
+    public async Task EnrollmentRoutesShareTheBusinessRateLimit()
     {
         using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
         using var client = CreateAuthenticatedClient(factory);
@@ -237,6 +332,8 @@ public class EnrollmentHttpContractTests
         Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
         using var rejectedGet = await client.GetAsync("/enrollments/1");
         Assert.AreEqual(HttpStatusCode.TooManyRequests, rejectedGet.StatusCode);
+        using var rejectedChange = await client.PostAsJsonAsync("/enrollments/1/seats", new { seats = 2 });
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, rejectedChange.StatusCode);
     }
 
     [TestMethod]
@@ -885,6 +982,16 @@ public class EnrollmentHttpContractTests
         public (long UserId, long ClassId, int Seats, string Key)? Arguments { get; private set; }
 
         public (long EnrollmentId, long UserId)? DetailsArguments { get; private set; }
+
+        public (long EnrollmentId, long UserId, int Seats)? SeatChangeArguments { get; private set; }
+
+        public ChangeSeatsResult SeatChangeResult { get; init; } = new ChangeSeatsResult.NotFound();
+
+        public Task<ChangeSeatsResult> ChangeSeatsAsync(long enrollmentId, long userId, int seats, CancellationToken ct)
+        {
+            SeatChangeArguments = (enrollmentId, userId, seats);
+            return Task.FromResult(SeatChangeResult);
+        }
 
         public Task<EnrollmentDetailsResponse?> GetDetailsAsync(
             long enrollmentId, long userId, CancellationToken ct)

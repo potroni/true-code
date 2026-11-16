@@ -13,6 +13,8 @@ public interface IEnrollmentService
 {
     Task<EnrollmentDetailsResponse?> GetDetailsAsync(long enrollmentId, long userId, CancellationToken ct);
 
+    Task<ChangeSeatsResult> ChangeSeatsAsync(long enrollmentId, long userId, int seats, CancellationToken ct);
+
     Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
 }
@@ -54,7 +56,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             new EnrollmentPassResponse(details.RemainingVisits, details.ValidUntil));
     }
 
-    internal async Task<ChangeSeatsResult> ChangeSeatsAsync(
+    public async Task<ChangeSeatsResult> ChangeSeatsAsync(
         long enrollmentId, long userId, int seats, CancellationToken ct)
     {
         var requestedAt = timeProvider.GetUtcNow().UtcDateTime;
@@ -239,15 +241,15 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
     };
 }
 
-internal abstract record ChangeSeatsResult
+public abstract record ChangeSeatsResult
 {
     private ChangeSeatsResult() { }
 
-    internal sealed record Success(EnrollmentDetailsResponse Details) : ChangeSeatsResult;
+    public sealed record Success(EnrollmentDetailsResponse Details) : ChangeSeatsResult;
 
-    internal sealed record NotFound : ChangeSeatsResult;
+    public sealed record NotFound : ChangeSeatsResult;
 
-    internal sealed record Conflict(string Reason) : ChangeSeatsResult;
+    public sealed record Conflict(string Reason) : ChangeSeatsResult;
 }
 
 internal abstract record SeatChangePreparation
