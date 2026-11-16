@@ -4,6 +4,7 @@ using DataAccessLayer.Entities;
 using DataAccessLayer.Repositories;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Npgsql;
 using WebApi.Contracts;
 
@@ -14,6 +15,8 @@ public interface IEnrollmentService
     Task<EnrollmentDetailsResponse?> GetDetailsAsync(long enrollmentId, long userId, CancellationToken ct);
 
     Task<ChangeSeatsResult> ChangeSeatsAsync(long enrollmentId, long userId, int seats, CancellationToken ct);
+
+    Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct);
 
     Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
@@ -33,6 +36,137 @@ public abstract record CreateEnrollmentResult
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
     private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
+
+    public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)
+    {
+        var requestedAt = timeProvider.GetUtcNow().UtcDateTime;
+        await using var transaction = await unitOfWork.DbContext.Database
+            .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+
+        var classId = await unitOfWork.Enrollment.FindOwnedClassIdAsync(enrollmentId, userId, ct);
+        if (classId is null)
+            return new CancelEnrollmentResult.NotFound();
+
+        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
+        if (activity is null)
+            return new CancelEnrollmentResult.NotFound();
+
+        var enrollment = await unitOfWork.Enrollment.FindOwnedAsync(enrollmentId, userId, ct);
+        if (enrollment is null || enrollment.ClassId != activity.Id)
+            return new CancelEnrollmentResult.NotFound();
+        if (enrollment.Status == "cancelled")
+            return new CancelEnrollmentResult.Success(
+                new CancelEnrollmentResponse(enrollment.Id, enrollment.RefundedVisits!.Value));
+        if (!activity.IsCancelled && HasStarted(activity))
+            return new CancelEnrollmentResult.Conflict("class-started");
+
+        var (candidates, availableSeats) = await GetPromotionCandidatesAsync(activity, enrollment.Seats, ct);
+        var passUserIds = candidates.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
+        var passes = await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
+
+        var cancelledAt = timeProvider.GetUtcNow().UtcDateTime;
+        if (!activity.IsCancelled && activity.StartsAt <= cancelledAt)
+            return new CancelEnrollmentResult.Conflict("class-started");
+
+        var refundedVisits = activity.IsCancelled || activity.StartsAt - requestedAt >= TimeSpan.FromHours(2)
+            ? enrollment.Seats
+            : 0;
+        var passesByUser = passes.ToDictionary(x => x.UserId);
+        var pass = passesByUser[userId];
+        var remainingVisits = (long)pass.RemainingVisits + refundedVisits;
+        // решение: отклоняем отмену целиком, если полный возврат не помещается в int.
+        if (remainingVisits > int.MaxValue)
+            return new CancelEnrollmentResult.Conflict("pass-balance-overflow");
+
+        var trackedEntries = new List<EntityEntry>();
+        try
+        {
+            trackedEntries.Add(unitOfWork.DbContext.Attach(enrollment));
+            trackedEntries.Add(unitOfWork.DbContext.Attach(pass));
+            enrollment.Status = "cancelled";
+            enrollment.CancelledAt = cancelledAt;
+            enrollment.RefundedVisits = refundedVisits;
+            pass.RemainingVisits = (int)remainingVisits;
+            await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, requestedAt, cancelledAt, trackedEntries, ct);
+            await unitOfWork.SaveChangesAsync(ct);
+            if (!activity.IsCancelled && HasStarted(activity))
+                return new CancelEnrollmentResult.Conflict("class-started");
+
+            await transaction.CommitAsync(ct);
+        }
+        finally
+        {
+            foreach (var entry in trackedEntries)
+                entry.State = EntityState.Detached;
+        }
+
+        return new CancelEnrollmentResult.Success(new CancelEnrollmentResponse(enrollment.Id, refundedVisits));
+    }
+
+    private async Task<(WaitlistEntry[] Candidates, long AvailableSeats)> GetPromotionCandidatesAsync(
+        Class activity, int releasedSeats, CancellationToken ct)
+    {
+        // решение: для отмененного клубом занятия очередь не продвигаем и блокируем только абонемент владельца.
+        if (activity.IsCancelled || releasedSeats <= 0)
+            return ([], 0);
+
+        var waiting = await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct);
+        if (waiting.Count == 0)
+            return ([], 0);
+
+        var availableSeats = activity.Capacity
+            - await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct) + releasedSeats;
+        // решение: до проверки абонементов не вычитаем места предыдущих заявок, поскольку они могут закрыться.
+        var candidates = waiting.TakeWhile(request => request.Seats <= availableSeats).ToArray();
+        return (candidates, availableSeats);
+    }
+
+    private async Task PromoteWaitlistAsync(
+        IReadOnlyList<WaitlistEntry> waiting,
+        IReadOnlyDictionary<long, Pass> passesByUser,
+        long availableSeats,
+        DateTime requestedAt,
+        DateTime promotedAt,
+        List<EntityEntry> trackedEntries,
+        CancellationToken ct)
+    {
+        var requestDate = DateOnly.FromDateTime(requestedAt);
+        foreach (var request in waiting)
+        {
+            // решение: сохраняем FIFO и продвигаем заявку целиком, поэтому при нехватке мест останавливаемся.
+            if (request.Seats > availableSeats)
+                break;
+
+            var pass = passesByUser[request.UserId];
+            trackedEntries.Add(unitOfWork.DbContext.Attach(request));
+            if (pass.ValidUntil < requestDate || pass.RemainingVisits < request.Seats)
+            {
+                // решение: закрываем заявку без брони, чтобы непригодный абонемент не задерживал очередь.
+                request.Status = WaitlistStatus.Closed;
+                continue;
+            }
+
+            var passEntry = unitOfWork.DbContext.Entry(pass);
+            if (passEntry.State == EntityState.Detached)
+            {
+                passEntry.State = EntityState.Unchanged;
+                trackedEntries.Add(passEntry);
+            }
+
+            var enrollment = new Enrollment
+            {
+                UserId = request.UserId,
+                ClassId = request.ClassId,
+                Seats = request.Seats,
+                Status = "active",
+                CreatedAt = promotedAt
+            };
+            trackedEntries.Add(await unitOfWork.DbContext.AddAsync(enrollment, ct));
+            pass.RemainingVisits -= request.Seats;
+            request.Status = WaitlistStatus.Promoted;
+            availableSeats -= request.Seats;
+        }
+    }
 
     public async Task<EnrollmentDetailsResponse?> GetDetailsAsync(
         long enrollmentId, long userId, CancellationToken ct)
@@ -84,7 +218,11 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         var seatDelta = seats - enrollment.Seats;
         if (seatDelta != 0)
         {
-            var pass = await LockPassAsync(userId, ct);
+            var (candidates, availableSeats) = await GetPromotionCandidatesAsync(activity, -seatDelta, ct);
+            var passUserIds = candidates.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
+            var passes = await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
+            var passesByUser = passes.ToDictionary(x => x.UserId);
+            var pass = passesByUser[userId];
             if (HasStarted(activity))
                 return new ChangeSeatsResult.Conflict("class-started");
 
@@ -100,7 +238,25 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             if (remainingVisits > int.MaxValue)
                 return new ChangeSeatsResult.Conflict("pass-balance-overflow");
 
-            await SaveSeatChangeAsync(enrollment, pass, seats, (int)remainingVisits, ct);
+            var changedAt = timeProvider.GetUtcNow().UtcDateTime;
+            if (activity.StartsAt <= changedAt)
+                return new ChangeSeatsResult.Conflict("class-started");
+
+            var trackedEntries = new List<EntityEntry>();
+            try
+            {
+                trackedEntries.Add(unitOfWork.DbContext.Attach(enrollment));
+                trackedEntries.Add(unitOfWork.DbContext.Attach(pass));
+                enrollment.Seats = seats;
+                pass.RemainingVisits = (int)remainingVisits;
+                await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, requestedAt, changedAt, trackedEntries, ct);
+                await unitOfWork.SaveChangesAsync(ct);
+            }
+            finally
+            {
+                foreach (var entry in trackedEntries)
+                    entry.State = EntityState.Detached;
+            }
         }
 
         var details = await GetDetailsAsync(enrollmentId, userId, ct)
@@ -110,24 +266,6 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
 
         await transaction.CommitAsync(ct);
         return new ChangeSeatsResult.Success(details);
-    }
-
-    private async Task SaveSeatChangeAsync(
-        Enrollment enrollment, Pass pass, int seats, int remainingVisits, CancellationToken ct)
-    {
-        var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
-        var passEntry = unitOfWork.DbContext.Attach(pass);
-        try
-        {
-            enrollment.Seats = seats;
-            pass.RemainingVisits = remainingVisits;
-            await unitOfWork.SaveChangesAsync(ct);
-        }
-        finally
-        {
-            enrollmentEntry.State = EntityState.Detached;
-            passEntry.State = EntityState.Detached;
-        }
     }
 
     public async Task<CreateEnrollmentResult> CreateAsync(
@@ -249,4 +387,15 @@ public abstract record ChangeSeatsResult
     public sealed record NotFound : ChangeSeatsResult;
 
     public sealed record Conflict(string Reason) : ChangeSeatsResult;
+}
+
+public abstract record CancelEnrollmentResult
+{
+    private CancelEnrollmentResult() { }
+
+    public sealed record Success(CancelEnrollmentResponse Response) : CancelEnrollmentResult;
+
+    public sealed record NotFound : CancelEnrollmentResult;
+
+    public sealed record Conflict(string Reason) : CancelEnrollmentResult;
 }

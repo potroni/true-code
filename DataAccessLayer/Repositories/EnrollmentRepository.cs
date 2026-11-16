@@ -62,3 +62,18 @@ public class EnrollmentRepository : GenericRepository<Enrollment>, IEnrollmentRe
         _dbSet.Where(x => x.ClassId == classId && x.Status == "active")
             .SumAsync(x => (long)x.Seats, ct);
 }
+
+public sealed record EnrollmentDetails(
+    long Id,
+    string Status,
+    int Seats,
+    DateTime CreatedAt,
+    long ClassId,
+    string ClassTitle,
+    DateTime StartsAt,
+    int DurationMinutes,
+    bool IsClassCancelled,
+    long RoomId,
+    string RoomName,
+    int RemainingVisits,
+    DateOnly ValidUntil);
