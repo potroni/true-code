@@ -11,6 +11,10 @@ namespace WebApi.Services;
 
 public interface IEnrollmentService
 {
+    Task<EnrollmentDetailsResponse?> GetDetailsAsync(long enrollmentId, long userId, CancellationToken ct);
+
+    Task<ChangeSeatsResult> ChangeSeatsAsync(long enrollmentId, long userId, int seats, CancellationToken ct);
+
     Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
 }
@@ -29,6 +33,102 @@ public abstract record CreateEnrollmentResult
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
     private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
+
+    public async Task<EnrollmentDetailsResponse?> GetDetailsAsync(
+        long enrollmentId, long userId, CancellationToken ct)
+    {
+        var details = await unitOfWork.Enrollment.GetDetailsAsync(enrollmentId, userId, ct);
+        if (details is null)
+            return null;
+
+        return new EnrollmentDetailsResponse(
+            details.Id,
+            details.Status,
+            details.Seats,
+            details.CreatedAt,
+            new EnrollmentClassResponse(
+                details.ClassId,
+                details.ClassTitle,
+                details.StartsAt,
+                details.DurationMinutes,
+                details.IsClassCancelled,
+                new EnrollmentRoomResponse(details.RoomId, details.RoomName)),
+            new EnrollmentPassResponse(details.RemainingVisits, details.ValidUntil));
+    }
+
+    public async Task<ChangeSeatsResult> ChangeSeatsAsync(
+        long enrollmentId, long userId, int seats, CancellationToken ct)
+    {
+        var requestedAt = timeProvider.GetUtcNow().UtcDateTime;
+        await using var transaction = await unitOfWork.DbContext.Database
+            .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+
+        var classId = await unitOfWork.Enrollment.FindOwnedClassIdAsync(enrollmentId, userId, ct);
+        if (classId is null)
+            return new ChangeSeatsResult.NotFound();
+
+        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
+        if (activity is null)
+            return new ChangeSeatsResult.NotFound();
+
+        var enrollment = await unitOfWork.Enrollment.FindOwnedAsync(enrollmentId, userId, ct);
+        if (enrollment is null || enrollment.ClassId != activity.Id)
+            return new ChangeSeatsResult.NotFound();
+        if (enrollment.Status == "cancelled")
+            return new ChangeSeatsResult.Conflict("enrollment-cancelled");
+        if (activity.IsCancelled)
+            return new ChangeSeatsResult.Conflict("class-cancelled");
+        if (HasStarted(activity))
+            return new ChangeSeatsResult.Conflict("class-started");
+
+        var seatDelta = seats - enrollment.Seats;
+        if (seatDelta != 0)
+        {
+            var pass = await LockPassAsync(userId, ct);
+            if (HasStarted(activity))
+                return new ChangeSeatsResult.Conflict("class-started");
+
+            if (seatDelta > 0)
+            {
+                var reason = await GetAdditionalSeatsConflictAsync(activity, pass, seatDelta, requestedAt, ct);
+                if (reason is not null)
+                    return new ChangeSeatsResult.Conflict(reason);
+            }
+
+            var remainingVisits = (long)pass.RemainingVisits - seatDelta;
+            // решение: отклоняем возврат целиком, если новый остаток не помещается в int.
+            if (remainingVisits > int.MaxValue)
+                return new ChangeSeatsResult.Conflict("pass-balance-overflow");
+
+            await SaveSeatChangeAsync(enrollment, pass, seats, (int)remainingVisits, ct);
+        }
+
+        var details = await GetDetailsAsync(enrollmentId, userId, ct)
+            ?? throw new InvalidOperationException("The locked enrollment must have details.");
+        if (HasStarted(activity))
+            return new ChangeSeatsResult.Conflict("class-started");
+
+        await transaction.CommitAsync(ct);
+        return new ChangeSeatsResult.Success(details);
+    }
+
+    private async Task SaveSeatChangeAsync(
+        Enrollment enrollment, Pass pass, int seats, int remainingVisits, CancellationToken ct)
+    {
+        var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
+        var passEntry = unitOfWork.DbContext.Attach(pass);
+        try
+        {
+            enrollment.Seats = seats;
+            pass.RemainingVisits = remainingVisits;
+            await unitOfWork.SaveChangesAsync(ct);
+        }
+        finally
+        {
+            enrollmentEntry.State = EntityState.Detached;
+            passEntry.State = EntityState.Detached;
+        }
+    }
 
     public async Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
@@ -80,21 +180,32 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         if (activity.IsCancelled)
             return (null, new CreateEnrollmentResult.Conflict("class-cancelled"));
 
-        var pass = (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
+        var pass = await LockPassAsync(userId, ct);
+        var reason = await GetAdditionalSeatsConflictAsync(activity, pass, seats, requestedAt, ct);
+        return reason is null ? (pass, null) : (null, new CreateEnrollmentResult.Conflict(reason));
+    }
 
-        // решение: очередь не резервирует места, чтобы доступность обычной брони определялась активными бронями.
-        var occupiedSeats = await unitOfWork.Enrollment.SumActiveSeatsAsync(classId, ct);
-        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
-            return (null, new CreateEnrollmentResult.Conflict("class-started"));
-        if (activity.Capacity - occupiedSeats < seats)
-            return (null, new CreateEnrollmentResult.Conflict("capacity-exceeded"));
+    private async Task<Pass> LockPassAsync(long userId, CancellationToken ct) =>
+        (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
 
-        if (pass.RemainingVisits < seats)
-            return (null, new CreateEnrollmentResult.Conflict("pass-exhausted"));
+    private bool HasStarted(Class activity) => activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime;
+
+    private async Task<string?> GetAdditionalSeatsConflictAsync(
+        Class activity, Pass pass, int additionalSeats, DateTime requestedAt, CancellationToken ct)
+    {
+        // решение: считаем только активные брони, поскольку заявки очереди не резервируют места.
+        var occupiedSeats = await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct);
+        if (HasStarted(activity))
+            return "class-started";
+        if (activity.Capacity - occupiedSeats < additionalSeats)
+            return "capacity-exceeded";
+
+        if (pass.RemainingVisits < additionalSeats)
+            return "pass-exhausted";
         if (pass.ValidUntil < DateOnly.FromDateTime(requestedAt))
-            return (null, new CreateEnrollmentResult.Conflict("pass-expired"));
+            return "pass-expired";
 
-        return (pass, null);
+        return null;
     }
 
     private async Task<string> SaveEnrollmentAsync(
@@ -127,4 +238,15 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             new CreateEnrollmentResult.Conflict("idempotency-key-conflict"),
         _ => throw new InvalidOperationException("Unexpected idempotency lookup result.")
     };
+}
+
+public abstract record ChangeSeatsResult
+{
+    private ChangeSeatsResult() { }
+
+    public sealed record Success(EnrollmentDetailsResponse Details) : ChangeSeatsResult;
+
+    public sealed record NotFound : ChangeSeatsResult;
+
+    public sealed record Conflict(string Reason) : ChangeSeatsResult;
 }

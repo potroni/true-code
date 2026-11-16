@@ -9,6 +9,46 @@ namespace WebApi.Controllers;
 [Route("enrollments")]
 public sealed class EnrollmentsController(IEnrollmentService enrollmentService) : BaseApiController
 {
+    [HttpGet("{id}")]
+    [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<EnrollmentDetailsResponse>> GetDetails(
+        [FromRoute] long id,
+        CancellationToken ct)
+    {
+        var details = await enrollmentService.GetDetailsAsync(id, CurrentUserId, ct);
+        if (details is null)
+            return Problem(statusCode: StatusCodes.Status404NotFound);
+
+        return Ok(details);
+    }
+
+    [HttpPost("{id}/seats")]
+    [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<EnrollmentDetailsResponse>> ChangeSeats(
+        [FromRoute] long id,
+        [FromRequiredBody, Required] ChangeSeatsRequest request,
+        CancellationToken ct)
+    {
+        var result = await enrollmentService.ChangeSeatsAsync(id, CurrentUserId, request.Seats, ct);
+
+        return result switch
+        {
+            ChangeSeatsResult.Success success => Ok(success.Details),
+            ChangeSeatsResult.NotFound => Problem(statusCode: StatusCodes.Status404NotFound),
+            ChangeSeatsResult.Conflict conflict => ConflictWithReason(conflict.Reason),
+            _ => throw new InvalidOperationException("Unexpected seat change result.")
+        };
+    }
+
     [HttpPost]
     [ProducesResponseType<EnrollmentResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
