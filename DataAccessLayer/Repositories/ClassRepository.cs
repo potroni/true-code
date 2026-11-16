@@ -36,4 +36,39 @@ public class ClassRepository : GenericRepository<Class>, IClassRepository
             .Include(x => x.Enrollments)
             .FirstOrDefaultAsync(x => x.Id == id, ct);
     }
+
+    public Task<List<ScheduleRow>> GetScheduleRowsAsync(DateTime from, DateTime to, long? roomId, long userId,
+        (DateTime StartsAt, long ClassId)? after, int take, CancellationToken ct = default)
+    {
+        var fromRemainder = from.Ticks % TimeSpan.TicksPerMicrosecond;
+        var toRemainder = to.Ticks % TimeSpan.TicksPerMicrosecond;
+        var fromMicrosecond = from.AddTicks(-fromRemainder);
+        var toMicrosecond = to.AddTicks(-toRemainder);
+
+        // решение: сравниваем с целыми микросекундами и меняем знак сравнения для дробных границ.
+        var classes = fromRemainder == 0
+            ? _dbSet.Where(x => x.StartsAt >= fromMicrosecond)
+            : _dbSet.Where(x => x.StartsAt > fromMicrosecond);
+        classes = toRemainder == 0
+            ? classes.Where(x => x.StartsAt < toMicrosecond)
+            : classes.Where(x => x.StartsAt <= toMicrosecond);
+
+        if (roomId is long room)
+            classes = classes.Where(x => x.RoomId == room);
+
+        if (after is { } cursor)
+        {
+            var (startsAt, classId) = cursor;
+            classes = classes.Where(x => x.StartsAt > startsAt || (x.StartsAt == startsAt && x.Id > classId));
+        }
+
+        return classes.OrderBy(x => x.StartsAt)
+            .ThenBy(x => x.Id)
+            .Take(take)
+            .Select(x => new ScheduleRow(x.Id, x.Title, x.StartsAt, x.DurationMinutes, x.RoomId, x.Room.Name,
+                x.Capacity,
+                (int)Math.Max(0L, x.Capacity - x.Enrollments.Where(e => e.Status == "active").Sum(e => (long)e.Seats)),
+                x.Enrollments.Where(e => e.Status == "active" && e.UserId == userId).Sum(e => e.Seats)))
+            .ToListAsync(ct);
+    }
 }
