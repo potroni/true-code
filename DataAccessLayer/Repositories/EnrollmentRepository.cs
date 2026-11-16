@@ -48,6 +48,14 @@ public class EnrollmentRepository : GenericRepository<Enrollment>, IEnrollmentRe
         return query.SingleOrDefaultAsync(ct);
     }
 
+    public Task<long?> FindOwnedClassIdAsync(long enrollmentId, long userId, CancellationToken ct = default) =>
+        _dbSet.Where(x => x.Id == enrollmentId && x.UserId == userId)
+            .Select(x => (long?)x.ClassId)
+            .SingleOrDefaultAsync(ct);
+
+    public Task<Enrollment?> FindOwnedAsync(long enrollmentId, long userId, CancellationToken ct = default) =>
+        _dbSet.AsNoTracking().SingleOrDefaultAsync(x => x.Id == enrollmentId && x.UserId == userId, ct);
+
     public Task<long> SumActiveSeatsAsync(long classId, CancellationToken ct = default) =>
         _dbSet.Where(x => x.ClassId == classId && x.Status == "active")
             .SumAsync(x => (long)x.Seats, ct);

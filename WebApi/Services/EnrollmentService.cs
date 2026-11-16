@@ -54,6 +54,42 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             new EnrollmentPassResponse(details.RemainingVisits, details.ValidUntil));
     }
 
+    internal async Task<SeatChangePreparation> PrepareSeatChangeAsync(
+        long enrollmentId, long userId, int seats, CancellationToken ct)
+    {
+        if (unitOfWork.DbContext.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("An active transaction is required to prepare a seat change.");
+
+        var classId = await unitOfWork.Enrollment.FindOwnedClassIdAsync(enrollmentId, userId, ct);
+        if (classId is null)
+            return new SeatChangePreparation.NotFound();
+
+        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
+        if (activity is null)
+            return new SeatChangePreparation.NotFound();
+
+        var enrollment = await unitOfWork.Enrollment.FindOwnedAsync(enrollmentId, userId, ct);
+        if (enrollment is null || enrollment.ClassId != activity.Id)
+            return new SeatChangePreparation.NotFound();
+
+        if (enrollment.Status == "cancelled")
+            return new SeatChangePreparation.Conflict("enrollment-cancelled");
+        if (activity.IsCancelled)
+            return new SeatChangePreparation.Conflict("class-cancelled");
+        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
+            return new SeatChangePreparation.Conflict("class-started");
+
+        var seatDelta = seats - enrollment.Seats;
+        if (seatDelta == 0)
+            return new SeatChangePreparation.Ready(enrollment, activity, seatDelta, Pass: null);
+
+        var pass = (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
+        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
+            return new SeatChangePreparation.Conflict("class-started");
+
+        return new SeatChangePreparation.Ready(enrollment, activity, seatDelta, pass);
+    }
+
     public async Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
     {
@@ -151,4 +187,16 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             new CreateEnrollmentResult.Conflict("idempotency-key-conflict"),
         _ => throw new InvalidOperationException("Unexpected idempotency lookup result.")
     };
+}
+
+internal abstract record SeatChangePreparation
+{
+    private SeatChangePreparation() { }
+
+    internal sealed record Ready(Enrollment Enrollment, Class Activity, int SeatDelta, Pass? Pass)
+        : SeatChangePreparation;
+
+    internal sealed record NotFound : SeatChangePreparation;
+
+    internal sealed record Conflict(string Reason) : SeatChangePreparation;
 }
