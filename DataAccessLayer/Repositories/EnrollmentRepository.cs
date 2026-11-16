@@ -17,4 +17,8 @@ public class EnrollmentRepository : GenericRepository<Enrollment>, IEnrollmentRe
             .Where(x => x.UserId == userId)
             .ToListAsync(ct);
     }
+
+    public Task<long> SumActiveSeatsAsync(long classId, CancellationToken ct = default) =>
+        _dbSet.Where(x => x.ClassId == classId && x.Status == "active")
+            .SumAsync(x => (long)x.Seats, ct);
 }
