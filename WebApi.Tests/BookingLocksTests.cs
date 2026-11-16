@@ -13,6 +13,93 @@ namespace WebApi.Tests;
 public class BookingLocksTests
 {
     [TestMethod]
+    [DataRow(4, 2, 0, 6, null)]
+    [DataRow(4, 2, 0, 5, "capacity-exceeded")]
+    [DataRow(4, 1, 0, 6, "pass-exhausted")]
+    [DataRow(4, 2, -1, 6, "pass-expired")]
+    [DataRow(1, 0, -1, 6, null)]
+    [DataRow(2, 0, -1, 6, null)]
+    public async Task SeatChangeAppliesOnlyTheDelta(
+        int seats, int remainingVisits, int validityOffset, int capacity, string? expectedConflict)
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var setupScope = factory.Services.CreateAsyncScope();
+        await using var changeScope = factory.Services.CreateAsyncScope();
+        var db = setupScope.ServiceProvider.GetRequiredService<ClubDbContext>();
+        var unit = changeScope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var now = new DateTimeOffset(2026, 11, 16, 23, 30, 0, TimeSpan.Zero);
+        var validUntil = DateOnly.FromDateTime(now.UtcDateTime).AddDays(validityOffset);
+        var enrollment = await AddEnrollmentAsync(db, now.AddHours(1));
+        var otherUserId = await db.Passes.Where(x => x.UserId != enrollment.UserId)
+            .Select(x => x.UserId).FirstAsync();
+        var pass = await db.Passes.SingleAsync(x => x.UserId == enrollment.UserId);
+        var originalVisits = pass.RemainingVisits;
+        var originalValidUntil = pass.ValidUntil;
+        var waiting = new WaitlistEntry
+        {
+            ClassId = enrollment.ClassId,
+            UserId = otherUserId,
+            Seats = 3,
+            CreatedAt = now.UtcDateTime
+        };
+        var otherEnrollment = new Enrollment
+        {
+            ClassId = enrollment.ClassId,
+            UserId = otherUserId,
+            Seats = 2,
+            Status = "active",
+            CreatedAt = now.UtcDateTime
+        };
+        var cancelledEnrollment = new Enrollment
+        {
+            ClassId = enrollment.ClassId,
+            UserId = otherUserId,
+            Seats = 4,
+            Status = "cancelled",
+            CreatedAt = now.UtcDateTime.AddMinutes(-1),
+            CancelledAt = now.UtcDateTime,
+            RefundedVisits = 4
+        };
+        try
+        {
+            enrollment.Class.Capacity = capacity;
+            pass.RemainingVisits = remainingVisits;
+            pass.ValidUntil = validUntil;
+            db.AddRange(waiting, otherEnrollment, cancelledEnrollment);
+            await db.SaveChangesAsync();
+
+            var service = new EnrollmentService(unit, new TestClock(now));
+            var result = await service.ChangeSeatsAsync(enrollment.Id, enrollment.UserId, seats, default);
+            var expectedSeats = expectedConflict is null ? seats : enrollment.Seats;
+            var expectedVisits = remainingVisits - (expectedSeats - enrollment.Seats);
+            if (expectedConflict is null)
+            {
+                var success = (ChangeSeatsResult.Success)result;
+                Assert.AreEqual(expectedSeats, success.Details.Seats);
+                Assert.AreEqual(expectedVisits, success.Details.Pass.RemainingVisits);
+                Assert.AreEqual(validUntil, success.Details.Pass.ValidUntil);
+                Assert.AreEqual(success, await service.ChangeSeatsAsync(enrollment.Id, enrollment.UserId, seats, default));
+            }
+            else
+            {
+                Assert.AreEqual(new ChangeSeatsResult.Conflict(expectedConflict), result);
+            }
+
+            Assert.AreEqual(expectedSeats, await db.Enrollments.Where(x => x.Id == enrollment.Id)
+                .Select(x => x.Seats).SingleAsync());
+            Assert.AreEqual(expectedVisits, await db.Passes.Where(x => x.Id == pass.Id)
+                .Select(x => x.RemainingVisits).SingleAsync());
+        }
+        finally
+        {
+            db.RemoveRange(waiting, otherEnrollment, cancelledEnrollment, enrollment, enrollment.Class);
+            pass.RemainingVisits = originalVisits;
+            pass.ValidUntil = originalValidUntil;
+            await db.SaveChangesAsync();
+        }
+    }
+
+    [TestMethod]
     [DataRow("active", false, false, null)]
     [DataRow("cancelled", false, false, "enrollment-cancelled")]
     [DataRow("active", true, false, "class-cancelled")]
