@@ -2,7 +2,9 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using DataAccessLayer;
 using DataAccessLayer.Entities;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Auth;
 
@@ -54,17 +56,46 @@ public class AnalyticsHttpContractTests
     }
 
     [TestMethod]
-    [DataRow("")]
-    [DataRow("&roomId=9223372036854775807")]
-    public async Task AcceptsSameDayAndOptionalLongRoomId(string suffix)
+    public async Task ReturnsExactJsonForSingleDayAndEmptyItemsWhenNothingMatches()
     {
         using var factory = new ApiApplicationFactory();
         using var client = factory.CreateClient();
         Authenticate(factory, client, ApiAuthorization.AdminRole);
 
-        using var response = await client.GetAsync(ValidUrl + suffix);
+        const string date = "2076-07-08";
+        var startsAt = new DateTime(2076, 7, 8, 0, 0, 0, DateTimeKind.Utc);
+        var room = new Room { Name = "Load HTTP contract room" };
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ClubDbContext>();
+            var userId = await db.Users.OrderBy(user => user.Id).Select(user => user.Id).FirstAsync();
+            var scheduledClass = new Class
+            {
+                Room = room, Title = "Yoga", StartsAt = startsAt, DurationMinutes = 60, Capacity = 12
+            };
+            db.Enrollments.Add(new Enrollment
+            {
+                Class = scheduledClass, UserId = userId, Status = "active", Seats = 3, CreatedAt = startsAt.AddDays(-1)
+            });
+            await db.SaveChangesAsync();
+        }
 
-        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var url = $"{Path}?from={date}&to={date}";
+        var item = (await GetItemsAsync(client, url)).EnumerateArray().Single();
+        AssertProperties(item, "date", "room", "classesCount", "totalCapacity", "bookedSeats");
+        Assert.AreEqual(date, item.GetProperty("date").GetString());
+        var roomJson = item.GetProperty("room");
+        AssertProperties(roomJson, "id", "name");
+        Assert.AreEqual(room.Id, roomJson.GetProperty("id").GetInt64());
+        Assert.AreEqual(room.Name, roomJson.GetProperty("name").GetString());
+        Assert.AreEqual(1, item.GetProperty("classesCount").GetInt32());
+        Assert.AreEqual(12, item.GetProperty("totalCapacity").GetInt32());
+        Assert.AreEqual(3, item.GetProperty("bookedSeats").GetInt32());
+
+        var unknownRoom = await GetItemsAsync(client, $"{url}&roomId={long.MaxValue}");
+        Assert.AreEqual(0, unknownRoom.GetArrayLength());
+        var emptyPeriod = await GetItemsAsync(client, Path + "?from=2076-07-09&to=2076-07-09");
+        Assert.AreEqual(0, emptyPeriod.GetArrayLength());
     }
 
     [TestMethod]
@@ -82,6 +113,7 @@ public class AnalyticsHttpContractTests
 
         using var rejected = await client.GetAsync(ValidUrl);
         Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+        Assert.AreEqual("application/problem+json", rejected.Content.Headers.ContentType?.MediaType);
     }
 
     [TestMethod]
@@ -116,6 +148,16 @@ public class AnalyticsHttpContractTests
         AssertProperties(item, "date", "room", "classesCount", "totalCapacity", "bookedSeats");
         Assert.AreEqual("date", item.GetProperty("date").GetProperty("format").GetString());
         AssertProperties(schemas.GetProperty("LoadRoomResponse").GetProperty("properties"), "id", "name");
+    }
+
+    private static async Task<JsonElement> GetItemsAsync(HttpClient client, string url)
+    {
+        using var response = await client.GetAsync(url);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        Assert.AreEqual("application/json", response.Content.Headers.ContentType?.MediaType);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        AssertProperties(body, "items");
+        return body.GetProperty("items");
     }
 
     private static void AssertProperties(JsonElement json, params string[] expected) =>
