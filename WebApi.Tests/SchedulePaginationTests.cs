@@ -41,6 +41,75 @@ public class SchedulePaginationTests
     }
 
     [TestMethod]
+    public async Task ScheduleFiltersClassesAndCountsOnlyActiveSeats()
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = factory.CreateClient();
+        var options = new DbContextOptionsBuilder<ClubDbContext>()
+            .UseNpgsql(TestDatabase.PostgresConnectionString)
+            .Options;
+        await using var db = new ClubDbContext(options);
+        var from = Start.Date.AddHours(10);
+        var to = from.AddHours(2);
+        var room = new Room { Name = "Schedule aggregation studio" };
+        var otherRoom = new Room { Name = "Schedule aggregation annex" };
+        var user = NewUser("schedule-aggregation-member@club.test");
+        var otherUser = NewUser("schedule-aggregation-guest@club.test");
+        var atFrom = Item(room, from);
+        var overCapacity = Item(room, from.AddMinutes(15));
+        var withoutBookings = Item(room, from.AddMinutes(30));
+        var cancelled = Item(room, from.AddMinutes(45));
+        cancelled.IsCancelled = true;
+        db.AddRange(user, otherUser, atFrom, overCapacity, withoutBookings, cancelled,
+            Item(room, from.AddTicks(-10)), Item(room, to), Item(otherRoom, from));
+        await db.SaveChangesAsync();
+
+        db.Enrollments.AddRange(
+            Booking(atFrom, user, 1),
+            Booking(atFrom, user, 2),
+            Booking(atFrom, otherUser, 4),
+            Booking(atFrom, user, 5, cancelled: true),
+            Booking(atFrom, otherUser, 6, cancelled: true),
+            Booking(overCapacity, otherUser, 11));
+        await db.SaveChangesAsync();
+
+        var service = new ScheduleService(new UnitOfWork(db));
+        var page = await ReadPage(room.Id);
+        CollectionAssert.AreEqual(new[] { atFrom.Id, overCapacity.Id, withoutBookings.Id },
+            page.Items.Select(item => item.ClassId).ToArray());
+        CollectionAssert.AreEqual(new[] { (3, 3), (0, 0), (10, 0) },
+            page.Items.Select(item => (item.FreeSeats, item.MySeats)).ToArray());
+        Assert.AreEqual(from, page.Items[0].StartsAt);
+        Assert.IsNull(page.ContinuationToken);
+
+        var empty = await ReadPage(long.MaxValue);
+        Assert.AreEqual(0, empty.Items.Count);
+        Assert.IsNull(empty.ContinuationToken);
+
+        Task<ScheduleResponse> ReadPage(long roomId) =>
+            service.GetPageAsync(new ScheduleQuery { From = from, To = to, RoomId = roomId },
+                user.Id, CancellationToken.None);
+
+        User NewUser(string email) =>
+            new() { Email = email, PasswordHash = "unused", Role = "user", CreatedAt = from.AddDays(-1) };
+
+        static Class Item(Room room, DateTime startsAt) =>
+            new() { Room = room, Title = "Yoga", StartsAt = startsAt, DurationMinutes = 60, Capacity = 10 };
+
+        Enrollment Booking(Class item, User member, int seats, bool cancelled = false) =>
+            new()
+            {
+                ClassId = item.Id,
+                UserId = member.Id,
+                Seats = seats,
+                Status = cancelled ? "cancelled" : "active",
+                CreatedAt = from.AddDays(-1),
+                CancelledAt = cancelled ? from.AddHours(-3) : null,
+                RefundedVisits = cancelled ? seats : null
+            };
+    }
+
+    [TestMethod]
     public async Task PagesUseStrictPairOrderAndTokenFromLastReturnedItem()
     {
         using var factory = new ApiApplicationFactory();
