@@ -360,9 +360,11 @@ public class EnrollmentHttpContractTests
 
         using var details = await client.GetAsync($"/enrollments/{id}");
         using var change = await client.PostAsJsonAsync($"/enrollments/{id}/seats", new { seats = 2 });
+        using var cancellation = await client.PostAsync($"/enrollments/{id}/cancel", null);
 
         await AssertBookingNotFoundAsync(details);
         await AssertBookingNotFoundAsync(change);
+        await AssertBookingNotFoundAsync(cancellation);
     }
 
     [TestMethod]
@@ -883,6 +885,7 @@ public class EnrollmentHttpContractTests
         var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
         var userId = await AddBookingClientAsync(db, now.UtcDateTime, initialVisits,
             DateOnly.FromDateTime(now.UtcDateTime).AddDays(-1));
+        var candidate = await AddBookingClientAsync(db, now.UtcDateTime, visits: 2);
         var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
         var activity = await db.Set<Class>().SingleAsync(x => x.Id == classId);
         activity.IsCancelled = classCancelled;
@@ -890,10 +893,14 @@ public class EnrollmentHttpContractTests
         var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime.AddDays(-1),
             historicalCancellation ? "cancelled" : "active");
         if (historicalCancellation)
-        {
             booking.RefundedVisits = 0;
-            await db.SaveChangesAsync();
-        }
+
+        var waiting = new WaitlistEntry
+        {
+            UserId = candidate, ClassId = classId, Seats = 2, CreatedAt = now.UtcDateTime
+        };
+        db.Add(waiting);
+        await db.SaveChangesAsync();
 
         using var client = CreateAuthenticatedClient(factory, userId);
         var route = $"/enrollments/{booking.Id}/cancel";
@@ -901,11 +908,16 @@ public class EnrollmentHttpContractTests
         if (conflict is not null)
         {
             Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
             var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
             Assert.AreEqual(conflict, problem.GetProperty("reason").GetString());
             await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: initialVisits);
+            await AssertQueueAsync(promoted: false);
             return;
         }
+
+        var expectedPromotion = !classCancelled && !historicalCancellation;
+        await AssertQueueAsync(expectedPromotion);
 
         using var repeat = await client.PostAsync(route, null);
         foreach (var result in new[] { response, repeat })
@@ -922,6 +934,38 @@ public class EnrollmentHttpContractTests
         Assert.AreEqual(refundedVisits, persisted.RefundedVisits);
         Assert.AreEqual(historicalCancellation ? booking.CancelledAt : now.UtcDateTime, persisted.CancelledAt);
         await AssertPersistedSeatsAndVisitsAsync(db, persisted, seats: 2, visits: initialVisits + refundedVisits);
+        await AssertQueueAsync(expectedPromotion);
+
+        async Task AssertQueueAsync(bool promoted)
+        {
+            Assert.AreEqual(promoted ? WaitlistStatus.Promoted : WaitlistStatus.Waiting,
+                await db.Set<WaitlistEntry>().Where(x => x.Id == waiting.Id)
+                .Select(x => x.Status).SingleAsync());
+            Assert.AreEqual(promoted ? 0 : 2, await db.Set<Pass>().Where(x => x.UserId == candidate)
+                .Select(x => x.RemainingVisits).SingleAsync());
+            Assert.AreEqual(promoted ? 1 : 0, await db.Set<Enrollment>().CountAsync(x => x.UserId == candidate));
+        }
+    }
+
+    [TestMethod]
+    public async Task CancelReturnsNotFoundForForeignAndMissingBookings()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
+        var caller = await AddBookingClientAsync(db, now.UtcDateTime, visits: 2);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
+
+        using var client = CreateAuthenticatedClient(factory, caller);
+        using var foreign = await client.PostAsync($"/enrollments/{booking.Id}/cancel?userId={owner}", null);
+        using var missing = await client.PostAsync($"/enrollments/{long.MaxValue}/cancel", null);
+
+        await AssertBookingNotFoundAsync(foreign);
+        await AssertBookingNotFoundAsync(missing);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 0);
     }
 
     [TestMethod]
@@ -937,16 +981,27 @@ public class EnrollmentHttpContractTests
         var exhausted = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
         var head = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
         var tail = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
-        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var earlier = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 4);
+        var otherClassId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 4);
         var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime.AddHours(-1));
 
+        var ignoredAt = now.UtcDateTime.AddMinutes(-2);
+        var ignoredRequests = new[]
+        {
+            await AddRequestAsync(tail, 1, otherClassId, ignoredAt),
+            await AddRequestAsync(tail, 1, classId, ignoredAt, WaitlistStatus.Cancelled),
+            await AddRequestAsync(tail, 1, classId, ignoredAt, WaitlistStatus.Promoted),
+            await AddRequestAsync(tail, 1, classId, ignoredAt, WaitlistStatus.Closed)
+        };
         var requests = new[]
         {
-            await AddRequestAsync(owner, 2),
-            await AddRequestAsync(expired, 1),
-            await AddRequestAsync(exhausted, 1),
-            await AddRequestAsync(head, 2),
-            await AddRequestAsync(tail, 1)
+            await AddRequestAsync(owner, 2, classId, now.UtcDateTime),
+            await AddRequestAsync(expired, 1, classId, now.UtcDateTime),
+            await AddRequestAsync(exhausted, 1, classId, now.UtcDateTime),
+            await AddRequestAsync(head, 2, classId, now.UtcDateTime),
+            await AddRequestAsync(tail, 1, classId, now.UtcDateTime),
+            await AddRequestAsync(earlier, 1, classId, now.UtcDateTime.AddMinutes(-1))
         };
 
         using var client = CreateAuthenticatedClient(factory, owner);
@@ -956,15 +1011,21 @@ public class EnrollmentHttpContractTests
         Assert.AreEqual(HttpStatusCode.OK, repeat.StatusCode);
         Assert.AreEqual(await response.Content.ReadAsStringAsync(), await repeat.Content.ReadAsStringAsync());
 
-        var statuses = await db.Set<WaitlistEntry>().Where(x => x.ClassId == classId)
+        var requestIds = requests.Select(x => x.Id).ToArray();
+        var statuses = await db.Set<WaitlistEntry>().Where(x => requestIds.Contains(x.Id))
             .OrderBy(x => x.Id).Select(x => x.Status).ToArrayAsync();
         CollectionAssert.AreEqual(
             new[] { WaitlistStatus.Promoted, WaitlistStatus.Closed, WaitlistStatus.Closed,
-                WaitlistStatus.Waiting, WaitlistStatus.Waiting }, statuses);
+                WaitlistStatus.Waiting, WaitlistStatus.Waiting, WaitlistStatus.Promoted }, statuses);
+        var ignoredIds = ignoredRequests.Select(x => x.Id).ToArray();
+        var ignoredStatuses = await db.Set<WaitlistEntry>().Where(x => ignoredIds.Contains(x.Id))
+            .OrderBy(x => x.Id).Select(x => x.Status).ToArrayAsync();
+        CollectionAssert.AreEqual(ignoredRequests.Select(x => x.Status).ToArray(), ignoredStatuses);
         var promoted = await db.Set<Enrollment>().AsNoTracking()
-            .SingleAsync(x => x.ClassId == classId && x.Status == "active");
-        Assert.AreNotEqual(booking.Id, promoted.Id);
-        Assert.AreEqual((owner, 2, now.UtcDateTime), (promoted.UserId, promoted.Seats, promoted.CreatedAt));
+            .Where(x => x.ClassId == classId && x.Status == "active").ToArrayAsync();
+        CollectionAssert.AreEquivalent(new[] { (earlier, 1, now.UtcDateTime), (owner, 2, now.UtcDateTime) },
+            promoted.Select(x => (x.UserId, x.Seats, x.CreatedAt)).ToArray());
+        Assert.IsFalse(await db.Set<Enrollment>().AnyAsync(x => x.ClassId == otherClassId));
         var cancelled = await db.Set<Enrollment>().AsNoTracking().SingleAsync(x => x.Id == booking.Id);
         Assert.AreEqual("cancelled", cancelled.Status);
         Assert.AreEqual(2, cancelled.RefundedVisits);
@@ -972,13 +1033,14 @@ public class EnrollmentHttpContractTests
         var otherUsers = requests.Skip(1).Select(x => x.UserId).ToArray();
         var otherBalances = await db.Set<Pass>().Where(x => otherUsers.Contains(x.UserId))
             .OrderBy(x => x.UserId).Select(x => x.RemainingVisits).ToArrayAsync();
-        CollectionAssert.AreEqual(new[] { 1, 0, 0, 1 }, otherBalances);
+        CollectionAssert.AreEqual(new[] { 1, 0, 0, 1, 0 }, otherBalances);
 
-        async Task<WaitlistEntry> AddRequestAsync(long userId, int seats)
+        async Task<WaitlistEntry> AddRequestAsync(
+            long userId, int seats, long requestClassId, DateTime createdAt, WaitlistStatus status = WaitlistStatus.Waiting)
         {
             var request = new WaitlistEntry
             {
-                ClassId = classId, UserId = userId, Seats = seats, CreatedAt = now.UtcDateTime
+                ClassId = requestClassId, UserId = userId, Seats = seats, CreatedAt = createdAt, Status = status
             };
             db.Add(request);
             await db.SaveChangesAsync();
