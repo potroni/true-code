@@ -50,9 +50,60 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
                     new JoinWaitlistResult.Conflict("idempotency-key-conflict"),
                 _ => throw new InvalidOperationException("Unexpected idempotency lookup result.")
             },
-            () => Task.FromResult<(JoinWaitlistResult, string?)>(
-                (new JoinWaitlistResult.PendingImplementation(), null)),
+            () => JoinWaitlistUnderClassLockAsync(userId, classId, seats, ct),
             ct);
+
+    private async Task<(JoinWaitlistResult Result, string? ResponseBody)> JoinWaitlistUnderClassLockAsync(
+        long userId, long classId, int seats, CancellationToken ct)
+    {
+        var activity = await unitOfWork.Class.LockByIdAsync(classId, ct);
+        if (activity is null)
+            return (new JoinWaitlistResult.ClassNotFound(), null);
+        if (activity.IsCancelled)
+            return (new JoinWaitlistResult.Conflict("class-cancelled"), null);
+        if (HasStarted(activity))
+            return (new JoinWaitlistResult.Conflict("class-started"), null);
+
+        // решение: проверяем действующую заявку раньше вместимости, чтобы сообщить о ней даже при свободных местах.
+        if (await unitOfWork.Waitlist.HasWaitingAsync(classId, userId, ct))
+            return (new JoinWaitlistResult.Conflict("already-waiting"), null);
+        // решение: отклоняем заявки, которые невозможно продвинуть целиком даже на пустое занятие.
+        if (seats > activity.Capacity)
+            return (new JoinWaitlistResult.Conflict("seats-exceed-capacity"), null);
+
+        var occupiedSeats = await unitOfWork.Enrollment.SumActiveSeatsAsync(classId, ct);
+        var createdAt = timeProvider.GetUtcNow().UtcDateTime;
+        if (activity.StartsAt <= createdAt)
+            return (new JoinWaitlistResult.Conflict("class-started"), null);
+        if (activity.Capacity - occupiedSeats >= seats)
+            return (new JoinWaitlistResult.Conflict("seats-available"), null);
+
+        var entry = new WaitlistEntry
+        {
+            UserId = userId,
+            ClassId = classId,
+            Seats = seats,
+            // решение: усекаем время до микросекунд для совпадения с PostgreSQL при расчете позиции.
+            CreatedAt = createdAt.AddTicks(-(createdAt.Ticks % TimeSpan.TicksPerMicrosecond)),
+            Status = WaitlistStatus.Waiting
+        };
+        await unitOfWork.Waitlist.CreateAsync(entry, ct);
+        try
+        {
+            await unitOfWork.SaveChangesAsync(ct);
+            var position = 1 + await unitOfWork.Waitlist.CountWaitingAheadAsync(entry, ct);
+            if (HasStarted(activity))
+                return (new JoinWaitlistResult.Conflict("class-started"), null);
+
+            var response = new JoinWaitlistResponse(entry.Id, entry.ClassId, entry.Seats, position, entry.CreatedAt);
+            var body = JsonSerializer.Serialize(response, JsonSerializerOptions.Web);
+            return (new JoinWaitlistResult.Success(body), body);
+        }
+        finally
+        {
+            unitOfWork.DbContext.Entry(entry).State = EntityState.Detached;
+        }
+    }
 
     public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)
     {

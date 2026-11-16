@@ -1784,7 +1784,7 @@ public partial class EnrollmentHttpContractTests
 
         public (long UserId, long ClassId, int Seats, string Key)? WaitlistArguments { get; private set; }
 
-        public JoinWaitlistResult WaitlistResult { get; init; } = new JoinWaitlistResult.PendingImplementation();
+        public JoinWaitlistResult WaitlistResult { get; init; } = new JoinWaitlistResult.ClassNotFound();
 
         public Task<JoinWaitlistResult> JoinWaitlistAsync(
             long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)

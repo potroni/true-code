@@ -157,7 +157,7 @@ public partial class EnrollmentHttpContractTests
         Assert.IsTrue(operation.GetProperty("requestBody").GetProperty("required").GetBoolean());
 
         var responses = operation.GetProperty("responses");
-        AssertProperties(responses, "201", "400", "401", "404", "409", "429", "501");
+        AssertProperties(responses, "201", "400", "401", "404", "409", "429");
         var schema = responses.GetProperty("201").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/JoinWaitlistResponse", schema.GetProperty("$ref").GetString());
@@ -168,15 +168,101 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task JoinWaitlistReportsPendingImplementationWithTheProductionService()
+    public async Task JoinWaitlistCreatesAnEntryInFifoOrderAndReplaysItsOriginalPosition()
     {
-        using var factory = new ApiApplicationFactory();
-        using var client = CreateAuthenticatedClient(factory);
-        using var request = CreateRequest(ValidBody, "key", WaitlistPath);
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero).AddTicks(9);
+        var storedTime = now.UtcDateTime.AddTicks(-9);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var users = await db.Set<User>().OrderBy(user => user.Id).Select(user => user.Id).Take(2).ToArrayAsync();
+        var classId = await AddBookingClassAsync(db, storedTime, capacity: 2);
+        var first = new WaitlistEntry
+        {
+            ClassId = classId, UserId = users[1], Seats = 1, CreatedAt = storedTime, Status = WaitlistStatus.Waiting
+        };
+        db.AddRange(
+            new Enrollment
+            {
+                ClassId = classId, UserId = users[0], Seats = 2, CreatedAt = storedTime, Status = "active"
+            },
+            first,
+            new WaitlistEntry
+            {
+                ClassId = classId, UserId = users[0], Seats = 1, CreatedAt = storedTime.AddMinutes(-1),
+                Status = WaitlistStatus.Cancelled
+            });
+        await db.SaveChangesAsync();
+        var visits = await db.Set<Pass>().Where(pass => pass.UserId == users[0])
+            .Select(pass => pass.RemainingVisits).SingleAsync();
+        var key = Guid.NewGuid().ToString("N");
+        var requestBody = $$"""{"classId":{{classId}},"seats":1}""";
+        using var client = CreateAuthenticatedClient(factory, users[0]);
+        using var request = CreateRequest(requestBody, key, WaitlistPath);
         using var response = await client.SendAsync(request);
 
-        Assert.AreEqual(HttpStatusCode.NotImplemented, response.StatusCode);
-        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        var result = JsonSerializer.Deserialize<JoinWaitlistResponse>(body, JsonSerializerOptions.Web)!;
+        var entry = await db.Set<WaitlistEntry>().AsNoTracking().SingleAsync(row => row.Id == result.Id);
+        Assert.AreEqual((classId, 1, 2, new DateTimeOffset(storedTime)),
+            (result.ClassId, result.Seats, result.Position, result.CreatedAt));
+        Assert.AreEqual((classId, users[0], 1, storedTime, WaitlistStatus.Waiting),
+            (entry.ClassId, entry.UserId, entry.Seats, entry.CreatedAt, entry.Status));
+        Assert.AreEqual(1, await db.Set<Enrollment>().CountAsync(booking => booking.ClassId == classId));
+        Assert.AreEqual(visits, await db.Set<Pass>().Where(pass => pass.UserId == users[0])
+            .Select(pass => pass.RemainingVisits).SingleAsync());
+
+        using var duplicate = CreateRequest(requestBody, Guid.NewGuid().ToString("N"), WaitlistPath);
+        using var duplicateResponse = await client.SendAsync(duplicate);
+        Assert.AreEqual(HttpStatusCode.Conflict, duplicateResponse.StatusCode);
+        var problem = await duplicateResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual("already-waiting", problem.GetProperty("reason").GetString());
+
+        first.Status = WaitlistStatus.Cancelled;
+        await db.SaveChangesAsync();
+        using var replay = CreateRequest(requestBody, key, WaitlistPath);
+        using var replayResponse = await client.SendAsync(replay);
+        Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
+        Assert.AreEqual(body, await replayResponse.Content.ReadAsStringAsync());
+    }
+
+    [TestMethod]
+    [DataRow("missing", 1, HttpStatusCode.NotFound, null)]
+    [DataRow("cancelled", 3, HttpStatusCode.Conflict, "class-cancelled")]
+    [DataRow("started", 3, HttpStatusCode.Conflict, "class-started")]
+    [DataRow("upcoming", 3, HttpStatusCode.Conflict, "seats-exceed-capacity")]
+    [DataRow("upcoming", 2, HttpStatusCode.Conflict, "seats-available")]
+    public async Task JoinWaitlistRejectsUnavailableRequests(string state, int seats, HttpStatusCode status, string? reason)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var classId = long.MaxValue;
+        if (state != "missing")
+        {
+            classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+            var activity = await db.Set<Class>().SingleAsync(row => row.Id == classId);
+            if (state == "started")
+                activity.StartsAt = now.UtcDateTime;
+            activity.IsCancelled = state == "cancelled";
+            await db.SaveChangesAsync();
+        }
+        var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
+        var key = Guid.NewGuid().ToString("N");
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var request = CreateRequest($$"""{"classId":{{classId}},"seats":{{seats}}}""", key, WaitlistPath);
+        using var response = await client.SendAsync(request);
+
+        Assert.AreEqual(status, response.StatusCode);
+        if (reason is not null)
+        {
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.AreEqual(reason, problem.GetProperty("reason").GetString());
+        }
+        Assert.IsFalse(await db.Set<WaitlistEntry>().AnyAsync(entry => entry.ClassId == classId));
+        Assert.IsFalse(await db.Set<IdempotencyEntry>().AnyAsync(entry => entry.OriginalKey == key));
     }
 
     [TestMethod]

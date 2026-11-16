@@ -9,6 +9,4 @@ public abstract record JoinWaitlistResult
     public sealed record ClassNotFound : JoinWaitlistResult;
 
     public sealed record Conflict(string Reason) : JoinWaitlistResult;
-
-    public sealed record PendingImplementation : JoinWaitlistResult;
 }

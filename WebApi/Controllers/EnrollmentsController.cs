@@ -16,7 +16,6 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status501NotImplemented)]
     public async Task<ActionResult<JoinWaitlistResponse>> JoinWaitlist(
         [FromRequiredBody, Required] JoinWaitlistRequest request,
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
@@ -35,7 +34,6 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
             },
             JoinWaitlistResult.ClassNotFound => Problem(statusCode: StatusCodes.Status404NotFound),
             JoinWaitlistResult.Conflict conflict => ConflictWithReason(conflict.Reason),
-            JoinWaitlistResult.PendingImplementation => Problem(statusCode: StatusCodes.Status501NotImplemented),
             _ => throw new InvalidOperationException("Unexpected waitlist result.")
         };
     }
