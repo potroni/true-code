@@ -1786,6 +1786,16 @@ public partial class EnrollmentHttpContractTests
 
         public JoinWaitlistResult WaitlistResult { get; init; } = new JoinWaitlistResult.ClassNotFound();
 
+        public (long Id, long UserId)? WaitlistCancellationArguments { get; private set; }
+
+        public CancelWaitlistResult WaitlistCancellationResult { get; init; } = new CancelWaitlistResult.NotFound();
+
+        public Task<CancelWaitlistResult> CancelWaitlistAsync(long id, long userId, CancellationToken ct)
+        {
+            WaitlistCancellationArguments = (id, userId);
+            return Task.FromResult(WaitlistCancellationResult);
+        }
+
         public Task<JoinWaitlistResult> JoinWaitlistAsync(
             long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
         {

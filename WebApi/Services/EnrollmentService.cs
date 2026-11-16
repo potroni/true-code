@@ -23,6 +23,8 @@ public interface IEnrollmentService
 
     Task<JoinWaitlistResult> JoinWaitlistAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
+
+    Task<CancelWaitlistResult> CancelWaitlistAsync(long id, long userId, CancellationToken ct);
 }
 
 public abstract record CreateEnrollmentResult
@@ -103,6 +105,55 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         {
             unitOfWork.DbContext.Entry(entry).State = EntityState.Detached;
         }
+    }
+
+    public async Task<CancelWaitlistResult> CancelWaitlistAsync(long id, long userId, CancellationToken ct)
+    {
+        await using var transaction = await unitOfWork.DbContext.Database
+            .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+
+        var classId = await unitOfWork.Waitlist.FindOwnedClassIdAsync(id, userId, ct);
+        if (classId is null)
+            return new CancelWaitlistResult.NotFound();
+
+        var activity = await unitOfWork.Class.LockByIdAsync(classId.Value, ct);
+        if (activity is null)
+            return new CancelWaitlistResult.NotFound();
+
+        var entry = await unitOfWork.Waitlist.FindOwnedAsync(id, userId, ct);
+        if (entry is null || entry.ClassId != activity.Id)
+            return new CancelWaitlistResult.NotFound();
+
+        var success = new CancelWaitlistResult.Success(new CancelWaitlistResponse(entry.Id));
+        switch (entry.Status)
+        {
+            case WaitlistStatus.Cancelled:
+                return success;
+            // решение: сохраняем итоговый статус, чтобы отличать созданную бронь от завершения без брони.
+            case WaitlistStatus.Promoted:
+                return new CancelWaitlistResult.Conflict("already-promoted");
+            case WaitlistStatus.Closed:
+                return new CancelWaitlistResult.Conflict("waitlist-closed");
+            case WaitlistStatus.Waiting:
+                break;
+            default:
+                throw new InvalidOperationException("Unexpected waitlist status.");
+        }
+
+        var trackedEntry = unitOfWork.DbContext.Attach(entry);
+        try
+        {
+            // решение: выход меняет только статус заявки, продвижение запускается при освобождении мест в брони.
+            entry.Status = WaitlistStatus.Cancelled;
+            await unitOfWork.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+        }
+        finally
+        {
+            trackedEntry.State = EntityState.Detached;
+        }
+
+        return success;
     }
 
     public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)

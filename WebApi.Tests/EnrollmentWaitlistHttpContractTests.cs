@@ -16,6 +16,105 @@ public partial class EnrollmentHttpContractTests
     private const string WaitlistPath = "/enrollments/waitlist";
 
     [TestMethod]
+    public async Task CancelWaitlistUsesJwtIdentityAndRequiresNeitherBodyNorKey()
+    {
+        var service = new EnrollmentServiceStub
+        {
+            WaitlistCancellationResult = new CancelWaitlistResult.Success(new CancelWaitlistResponse(long.MaxValue))
+        };
+        using var factory = new EnrollmentApplicationFactory(service);
+        using var authenticated = CreateAuthenticatedClient(factory);
+        using var anonymous = factory.CreateClient();
+        var path = $"{WaitlistPath}/{long.MaxValue}/cancel?userId=99";
+        using var unauthorized = await anonymous.PostAsync(path, null);
+        using var invalidId = await authenticated.PostAsync($"{WaitlistPath}/invalid/cancel", null);
+        Assert.AreEqual(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
+        Assert.AreEqual(HttpStatusCode.BadRequest, invalidId.StatusCode);
+        Assert.IsNull(service.WaitlistCancellationArguments);
+
+        using var response = await authenticated.PostAsync(path, null);
+        Assert.AreEqual((long.MaxValue, UserId), service.WaitlistCancellationArguments);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        AssertProperties(body, "id", "status");
+        Assert.AreEqual(long.MaxValue, body.GetProperty("id").GetInt64());
+        Assert.AreEqual("cancelled", body.GetProperty("status").GetString());
+    }
+
+    [TestMethod]
+    public async Task CancelWaitlistDocumentsItsContractInOpenApi()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var operation = document.GetProperty("paths").GetProperty(WaitlistPath + "/{id}/cancel")
+            .GetProperty("post");
+        Assert.IsFalse(operation.TryGetProperty("requestBody", out _));
+        var parameters = operation.GetProperty("parameters");
+        Assert.AreEqual(1, parameters.GetArrayLength());
+        Assert.AreEqual("id", parameters[0].GetProperty("name").GetString());
+        Assert.AreEqual("path", parameters[0].GetProperty("in").GetString());
+        AssertProperties(operation.GetProperty("responses"), "200", "400", "401", "404", "409", "429");
+        var properties = document.GetProperty("components").GetProperty("schemas")
+            .GetProperty("CancelWaitlistResponse").GetProperty("properties");
+        AssertProperties(properties, "id", "status");
+    }
+
+    [TestMethod]
+    [DataRow(WaitlistStatus.Waiting, null)]
+    [DataRow(WaitlistStatus.Promoted, "already-promoted")]
+    [DataRow(WaitlistStatus.Closed, "waitlist-closed")]
+    public async Task CancelWaitlistRespectsOwnershipAndPreservesFinalStates(WaitlistStatus status, string? reason)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var users = await db.Set<User>().OrderBy(user => user.Id).Select(user => user.Id).Take(2).ToArrayAsync();
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        var entry = new WaitlistEntry
+        {
+            ClassId = classId, UserId = users[0], Seats = 1, CreatedAt = now.UtcDateTime, Status = status
+        };
+        var next = new WaitlistEntry
+        {
+            ClassId = classId, UserId = users[1], Seats = 1, CreatedAt = now.UtcDateTime.AddSeconds(1),
+            Status = WaitlistStatus.Waiting
+        };
+        db.AddRange(entry, next);
+        await db.SaveChangesAsync();
+
+        using var owner = CreateAuthenticatedClient(factory, users[0]);
+        using var other = CreateAuthenticatedClient(factory, users[1]);
+        var path = $"{WaitlistPath}/{entry.Id}/cancel";
+        using var foreign = await other.PostAsync(path, null);
+        using var missing = await other.PostAsync($"{WaitlistPath}/0/cancel", null);
+        Assert.AreEqual(HttpStatusCode.NotFound, foreign.StatusCode);
+        Assert.AreEqual(missing.StatusCode, foreign.StatusCode);
+
+        using var response = await owner.PostAsync(path, null);
+        if (reason is null)
+        {
+            Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+            using var repeat = await owner.PostAsync(path, null);
+            Assert.AreEqual(HttpStatusCode.OK, repeat.StatusCode);
+            Assert.AreEqual(await response.Content.ReadAsStringAsync(), await repeat.Content.ReadAsStringAsync());
+        }
+        else
+        {
+            Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.AreEqual(reason, problem.GetProperty("reason").GetString());
+        }
+
+        var stored = await db.Set<WaitlistEntry>().AsNoTracking().SingleAsync(row => row.Id == entry.Id);
+        Assert.AreEqual(status == WaitlistStatus.Waiting ? WaitlistStatus.Cancelled : status, stored.Status);
+        var following = await db.Set<WaitlistEntry>().AsNoTracking().SingleAsync(row => row.Id == next.Id);
+        Assert.AreEqual(WaitlistStatus.Waiting, following.Status);
+        Assert.IsFalse(await db.Set<Enrollment>().AnyAsync(booking => booking.ClassId == classId));
+    }
+
+    [TestMethod]
     public async Task JoinWaitlistUsesJwtIdentityAndReturnsTheWaitlistFields()
     {
         var createdAt = EnrollmentServiceStub.CreatedAt;
@@ -121,7 +220,9 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task JoinWaitlistSharesTheBusinessRateLimit()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task WaitlistRoutesShareTheBusinessRateLimit(bool cancel)
     {
         using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub
         {
@@ -137,7 +238,9 @@ public partial class EnrollmentHttpContractTests
             Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
         }
 
-        using var rejectedRequest = CreateRequest(ValidBody, "key", WaitlistPath);
+        using var rejectedRequest = cancel
+            ? new HttpRequestMessage(HttpMethod.Post, $"{WaitlistPath}/1/cancel")
+            : CreateRequest(ValidBody, "key", WaitlistPath);
         using var rejected = await client.SendAsync(rejectedRequest);
         Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
         Assert.AreEqual("application/problem+json", rejected.Content.Headers.ContentType?.MediaType);
