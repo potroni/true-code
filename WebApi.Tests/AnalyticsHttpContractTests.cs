@@ -64,7 +64,7 @@ public class AnalyticsHttpContractTests
 
         using var response = await client.GetAsync(ValidUrl + suffix);
 
-        Assert.AreEqual(HttpStatusCode.NotImplemented, response.StatusCode);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
     }
 
     [TestMethod]
@@ -103,7 +103,7 @@ public class AnalyticsHttpContractTests
 
         Assert.AreEqual("int64", parameters["roomId"].GetProperty("schema").GetProperty("format").GetString());
         var responses = operation.GetProperty("responses");
-        AssertProperties(responses, "200", "400", "401", "403", "429", "501");
+        AssertProperties(responses, "200", "400", "401", "403", "429");
         var responseSchema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/LoadResponse", responseSchema.GetProperty("$ref").GetString());

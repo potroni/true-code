@@ -72,6 +72,32 @@ public class LoadClassSelectionTests
                 .Select(x => x.Id).SingleAsync());
     }
 
+    [TestMethod]
+    public async Task AggregatesUtcDayWithoutRepeatingCapacityForMultipleBookings()
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = factory.CreateClient();
+        await using var db = OpenContext();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        await db.Database.ExecuteSqlRawAsync("SET LOCAL TIME ZONE 'America/Los_Angeles'");
+
+        var date = new DateOnly(2076, 6, 10);
+        var midnight = date.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        var room = new Room { Name = "Load aggregation room" };
+        var booked = NewClass(room, midnight);
+        var empty = NewClass(room, midnight.AddHours(12));
+        var userId = await db.Users.OrderBy(user => user.Id).Select(user => user.Id).FirstAsync();
+        db.AddRange(booked, empty,
+            new Enrollment { Class = booked, UserId = userId, Seats = 2, Status = "active", CreatedAt = midnight },
+            new Enrollment { Class = booked, UserId = userId, Seats = 3, Status = "active", CreatedAt = midnight });
+        await db.SaveChangesAsync();
+
+        var repository = new ClassRepository(db.Classes, db.Database);
+        var rows = await repository.GetLoadRowsAsync(date, date, room.Id);
+
+        CollectionAssert.AreEqual(new[] { new LoadRow(date, room.Id, room.Name, 2, 20, 5) }, rows);
+    }
+
     private static ClubDbContext OpenContext() => new(new DbContextOptionsBuilder<ClubDbContext>()
         .UseNpgsql(TestDatabase.PostgresConnectionString).Options);
 

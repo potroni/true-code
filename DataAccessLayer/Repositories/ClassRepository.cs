@@ -64,6 +64,26 @@ public class ClassRepository : GenericRepository<Class>, IClassRepository
         return classes.AsNoTracking();
     }
 
+    public Task<List<LoadRow>> GetLoadRowsAsync(DateOnly from, DateOnly to, long? roomId,
+        CancellationToken ct = default)
+    {
+        return QueryClassesForLoad(from, to, roomId)
+            .Select(x => new
+            {
+                Date = DateOnly.FromDateTime(x.StartsAt),
+                x.RoomId,
+                RoomName = x.Room.Name,
+                x.Capacity,
+                BookedSeats = x.Enrollments.Where(e => e.Status == "active").Sum(e => (long)e.Seats)
+            })
+            .GroupBy(x => new { x.Date, x.RoomId, x.RoomName })
+            .OrderBy(group => group.Key.Date)
+            .ThenBy(group => group.Key.RoomId)
+            .Select(group => new LoadRow(group.Key.Date, group.Key.RoomId, group.Key.RoomName,
+                group.Count(), (int)group.Sum(x => (long)x.Capacity), (int)group.Sum(x => x.BookedSeats)))
+            .ToListAsync(ct);
+    }
+
     public Task<List<ScheduleRow>> GetScheduleRowsAsync(DateTime from, DateTime to, long? roomId, long userId,
         (DateTime StartsAt, long ClassId)? after, int take, CancellationToken ct = default)
     {
