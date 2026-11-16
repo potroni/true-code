@@ -362,6 +362,199 @@ public class EnrollmentHttpContractTests
         }
     }
 
+    [TestMethod]
+    public async Task CreateReplaysOriginalResponseAfterResizeAndCancellation()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var now = DateTime.UtcNow;
+        var userId = await AddBookingClientAsync(db, now, visits: 3);
+        var classId = await AddBookingClassAsync(db, now, capacity: 3);
+        var key = Guid.NewGuid().ToString("N");
+        var body = $$"""{"classId":{{classId}},"seats":1}""";
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var request = CreateRequest(body, key);
+        using var created = await client.SendAsync(request);
+        Assert.AreEqual(HttpStatusCode.Created, created.StatusCode);
+        var original = await created.Content.ReadAsByteArrayAsync();
+        var booking = JsonSerializer.Deserialize<EnrollmentResponse>(original, JsonSerializerOptions.Web);
+        Assert.IsNotNull(booking);
+
+        var enrollment = await db.Set<Enrollment>().SingleAsync(entry => entry.Id == booking.Id);
+        var pass = await db.Set<Pass>().SingleAsync(entry => entry.UserId == userId);
+        await db.Entry(pass).ReloadAsync();
+        enrollment.Seats = 2;
+        pass.RemainingVisits -= 1;
+        await db.SaveChangesAsync();
+        await AssertReplayAsync(expectedVisits: 1);
+
+        enrollment.Status = "cancelled";
+        enrollment.CancelledAt = now.AddMinutes(1);
+        enrollment.RefundedVisits = 2;
+        pass.RemainingVisits += 2;
+        await db.SaveChangesAsync();
+        await AssertReplayAsync(expectedVisits: 3);
+
+        async Task AssertReplayAsync(int expectedVisits)
+        {
+            using var replay = CreateRequest(body, key);
+            using var response = await client.SendAsync(replay);
+            Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
+            CollectionAssert.AreEqual(original, await response.Content.ReadAsByteArrayAsync());
+
+            var persisted = await db.Set<Enrollment>().AsNoTracking().SingleAsync(entry => entry.UserId == userId);
+            Assert.AreEqual((booking.Id, enrollment.Seats, enrollment.Status, enrollment.RefundedVisits),
+                (persisted.Id, persisted.Seats, persisted.Status, persisted.RefundedVisits));
+            Assert.AreEqual(expectedVisits, await db.Set<Pass>().Where(entry => entry.UserId == userId)
+                .Select(entry => entry.RemainingVisits).SingleAsync());
+            Assert.AreEqual(1, await db.Set<IdempotencyEntry>().CountAsync(entry => entry.UserId == userId));
+        }
+    }
+
+    [TestMethod]
+    [DataRow(true, false, false, null)]
+    [DataRow(true, true, false, "idempotency-key-conflict")]
+    [DataRow(false, false, true, "capacity-exceeded")]
+    [DataRow(false, true, false, "pass-exhausted")]
+    public async Task ConcurrentCreatesCommitOnlyOneBooking(
+        bool sameKey, bool differentClasses, bool differentUsers, string? rejectionReason)
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var now = DateTime.UtcNow;
+        const int seats = 1;
+        var firstUser = await AddBookingClientAsync(db, now, seats);
+        var secondUser = differentUsers ? await AddBookingClientAsync(db, now, seats) : firstUser;
+        var classCapacity = differentClasses ? seats + 1 : seats;
+        var firstClass = await AddBookingClassAsync(db, now, classCapacity);
+        var secondClass = differentClasses ? await AddBookingClassAsync(db, now, classCapacity) : firstClass;
+        var firstKey = Guid.NewGuid().ToString("N");
+        var secondKey = sameKey ? firstKey : Guid.NewGuid().ToString("N");
+        using var firstClient = CreateAuthenticatedClient(factory, firstUser);
+        using var secondClient = CreateAuthenticatedClient(factory, secondUser);
+        using var firstRequest = CreateRequest($$"""{"classId":{{firstClass}},"seats":{{seats}}}""", firstKey);
+        using var secondRequest = CreateRequest($$"""{"classId":{{secondClass}},"seats":{{seats}}}""", secondKey);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        if (!sameKey && differentClasses)
+            Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([firstUser], ct));
+        else
+            Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(firstClass, ct));
+
+        var firstPending = firstClient.SendAsync(firstRequest, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 1, ct);
+            var secondPending = secondClient.SendAsync(secondRequest, ct);
+            await WaitForBlockedRequestsAsync(db, 2, ct);
+            await gate.CommitAsync(ct);
+
+            using var first = await firstPending;
+            using var second = await secondPending;
+            var firstWon = first.StatusCode == HttpStatusCode.Created;
+            var winner = firstWon ? first : second;
+            var loser = firstWon ? second : first;
+            Assert.AreEqual(HttpStatusCode.Created, winner.StatusCode);
+            var winnerBody = await winner.Content.ReadAsStringAsync(ct);
+            if (rejectionReason is null)
+            {
+                Assert.AreEqual(HttpStatusCode.Created, loser.StatusCode);
+                Assert.AreEqual(winnerBody, await loser.Content.ReadAsStringAsync(ct));
+            }
+            else
+            {
+                Assert.AreEqual(HttpStatusCode.Conflict, loser.StatusCode);
+                var problem = await loser.Content.ReadFromJsonAsync<JsonElement>(ct);
+                Assert.AreEqual(rejectionReason, problem.GetProperty("reason").GetString());
+            }
+
+            var winnerUser = firstWon ? firstUser : secondUser;
+            var winnerClass = firstWon ? firstClass : secondClass;
+            var winnerKey = firstWon ? firstKey : secondKey;
+            var persisted = await db.Set<Enrollment>().SingleAsync(
+                entry => entry.ClassId == firstClass || entry.ClassId == secondClass, ct);
+            Assert.AreEqual((winnerUser, winnerClass, seats, "active"),
+                (persisted.UserId, persisted.ClassId, persisted.Seats, persisted.Status));
+            var enrollment = JsonSerializer.Deserialize<EnrollmentResponse>(winnerBody, JsonSerializerOptions.Web);
+            Assert.IsNotNull(enrollment);
+            Assert.AreEqual(persisted.Id, enrollment.Id);
+            var journal = await db.Set<IdempotencyEntry>().SingleAsync(
+                entry => entry.OriginalKey == firstKey || entry.OriginalKey == secondKey, ct);
+            Assert.AreEqual((winnerUser, winnerClass, seats, winnerKey, winnerBody),
+                (journal.UserId, journal.ClassId, journal.Seats, journal.OriginalKey, journal.ResponseBody));
+            var balances = await db.Set<Pass>().AsNoTracking()
+                .Where(pass => pass.UserId == firstUser || pass.UserId == secondUser)
+                .ToDictionaryAsync(pass => pass.UserId, pass => pass.RemainingVisits, ct);
+            Assert.AreEqual(0, balances[winnerUser]);
+            if (differentUsers)
+                Assert.AreEqual(seats, balances[firstWon ? secondUser : firstUser]);
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+        }
+    }
+
+    private static async Task WaitForBlockedRequestsAsync(DbContext db, int expected, CancellationToken ct)
+    {
+        while (await db.Database.SqlQueryRaw<int>(
+            """
+            WITH RECURSIVE blocked(pid) AS (
+                SELECT pg_backend_pid()
+                UNION
+                SELECT waiting.pid
+                FROM blocked
+                JOIN pg_locks AS waiting ON NOT waiting.granted
+                    AND blocked.pid = ANY(pg_blocking_pids(waiting.pid))
+            )
+            SELECT COUNT(*)::int - 1 AS "Value" FROM blocked
+            """).SingleAsync(ct) < expected)
+        {
+            await Task.Delay(20, ct);
+        }
+    }
+
+    private static async Task<long> AddBookingClientAsync(DbContext db, DateTime now, int visits)
+    {
+        var user = new User
+        {
+            Email = $"booking-{Guid.NewGuid():N}@club.test",
+            PasswordHash = "unused",
+            Role = "user",
+            CreatedAt = now
+        };
+        db.Add(user);
+        await db.SaveChangesAsync();
+        db.Add(new Pass
+        {
+            UserId = user.Id,
+            RemainingVisits = visits,
+            ValidUntil = DateOnly.FromDateTime(now).AddDays(1)
+        });
+        await db.SaveChangesAsync();
+        return user.Id;
+    }
+
+    private static async Task<long> AddBookingClassAsync(DbContext db, DateTime now, int capacity)
+    {
+        var activity = new Class
+        {
+            RoomId = await db.Set<Room>().Select(room => room.Id).FirstAsync(),
+            Title = "Booking test",
+            StartsAt = now.AddDays(1),
+            DurationMinutes = 60,
+            Capacity = capacity
+        };
+        db.Add(activity);
+        await db.SaveChangesAsync();
+        return activity.Id;
+    }
+
     private static HttpClient CreateAuthenticatedClient(ApiApplicationFactory factory, long userId = UserId)
     {
         var client = factory.CreateClient();
