@@ -21,7 +21,7 @@ using WebApi.Services;
 namespace WebApi.Tests;
 
 [TestClass]
-public class EnrollmentHttpContractTests
+public partial class EnrollmentHttpContractTests
 {
     private const long UserId = 17;
     private const string ValidBody = """{"classId":42,"seats":2,"userId":99}""";
