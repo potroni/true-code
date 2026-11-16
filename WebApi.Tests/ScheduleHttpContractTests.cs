@@ -1,0 +1,189 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json;
+using DataAccessLayer.Entities;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+using WebApi.Auth;
+using WebApi.Contracts;
+using WebApi.Services;
+
+namespace WebApi.Tests;
+
+[TestClass]
+public class ScheduleHttpContractTests
+{
+    private const long UserId = 42;
+    private const string Path = "/schedule";
+    private const string ValidUrl = Path + "?from=2026-09-22T12:00%2B02:00&to=2026-09-22T13:00";
+
+    [TestMethod]
+    [DataRow(null)]
+    [DataRow("invalid")]
+    public async Task RequiresValidJwt(string? token)
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = factory.CreateClient();
+        if (token is not null)
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        using var response = await client.GetAsync(ValidUrl);
+
+        Assert.AreEqual(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [TestMethod]
+    [DataRow("?to=2026-09-22T13:00")]
+    [DataRow("?from=2026-09-22T10:00")]
+    [DataRow("?from=2026-09-22&to=2026-09-22T13:00")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T12:00%2B02:00")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T09:59")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&roomId=no")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=no")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=0")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=101")]
+    public async Task InvalidQueryReturnsValidationProblem(string queryString)
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = CreateAuthenticatedClient(factory);
+        using var response = await client.GetAsync(Path + queryString);
+
+        Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+    }
+
+    [TestMethod]
+    [DataRow("", 20)]
+    [DataRow("&limit=1", 1)]
+    [DataRow("&limit=100", 100)]
+    public async Task ForwardsValidatedQueryAndJwtUserAndReturnsClosedResponse(string limit, int expectedLimit)
+    {
+        var service = new ScheduleServiceStub();
+        using var factory = new ScheduleApplicationFactory(service);
+        using var client = CreateAuthenticatedClient(factory);
+        using var response = await client.GetAsync(
+            ValidUrl + "&roomId=4294967296&continuationToken=opaque&userId=99" + limit);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        Assert.AreEqual(UserId, service.UserId);
+        var query = service.Query;
+        Assert.IsNotNull(query);
+        Assert.AreEqual(new DateTime(2026, 9, 22, 10, 0, 0, DateTimeKind.Utc), query.From);
+        Assert.AreEqual(new DateTime(2026, 9, 22, 13, 0, 0, DateTimeKind.Utc), query.To);
+        Assert.AreEqual(DateTimeKind.Utc, query.From.Kind);
+        Assert.AreEqual(DateTimeKind.Utc, query.To.Kind);
+        Assert.AreEqual(4294967296L, query.RoomId);
+        Assert.AreEqual(expectedLimit, query.Limit);
+        Assert.AreEqual("opaque", query.ContinuationToken);
+
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>();
+        AssertProperties(json, "items", "continuationToken");
+        Assert.AreEqual("next", json.GetProperty("continuationToken").GetString());
+        var item = json.GetProperty("items").EnumerateArray().Single();
+        AssertProperties(item, "classId", "title", "startsAt", "durationMinutes", "room", "capacity",
+            "freeSeats", "mySeats");
+        Assert.AreEqual("2026-09-22T10:00:00Z", item.GetProperty("startsAt").GetString());
+        AssertProperties(item.GetProperty("room"), "id", "name");
+    }
+
+    [TestMethod]
+    public async Task EmptyPageContainsExplicitNullToken()
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = CreateAuthenticatedClient(factory);
+        using var response = await client.GetAsync(ValidUrl);
+
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var json = await response.Content.ReadFromJsonAsync<JsonElement>();
+        AssertProperties(json, "items", "continuationToken");
+        Assert.AreEqual(0, json.GetProperty("items").GetArrayLength());
+        Assert.AreEqual(JsonValueKind.Null, json.GetProperty("continuationToken").ValueKind);
+    }
+
+    [TestMethod]
+    public async Task SharesRateLimitWithEnrollmentRoutes()
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = CreateAuthenticatedClient(factory);
+        for (var i = 0; i < 60; i++)
+        {
+            using var response = await client.GetAsync("/enrollments/not-a-number");
+            Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
+        }
+
+        using var rejected = await client.GetAsync(ValidUrl);
+
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+    }
+
+    [TestMethod]
+    public async Task DocumentsQueryParametersAndResponsesInOpenApi()
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = factory.CreateClient();
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var operation = document.GetProperty("paths").GetProperty(Path).GetProperty("get");
+        var parameters = operation.GetProperty("parameters").EnumerateArray()
+            .ToDictionary(parameter => parameter.GetProperty("name").GetString()!);
+        CollectionAssert.AreEquivalent(new[] { "from", "to", "roomId", "limit", "continuationToken" },
+            parameters.Keys.ToArray());
+        Assert.IsTrue(parameters["from"].GetProperty("required").GetBoolean());
+        Assert.IsTrue(parameters["to"].GetProperty("required").GetBoolean());
+        Assert.AreEqual("date-time", parameters["from"].GetProperty("schema").GetProperty("format").GetString());
+        Assert.AreEqual("int64", parameters["roomId"].GetProperty("schema").GetProperty("format").GetString());
+        var limit = parameters["limit"].GetProperty("schema");
+        Assert.AreEqual(20, limit.GetProperty("default").GetInt32());
+        Assert.AreEqual(1, limit.GetProperty("minimum").GetInt32());
+        Assert.AreEqual(100, limit.GetProperty("maximum").GetInt32());
+
+        var responses = operation.GetProperty("responses");
+        AssertProperties(responses, "200", "400", "401", "429");
+        var schema = responses.GetProperty("200").GetProperty("content")
+            .GetProperty("application/json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/ScheduleResponse", schema.GetProperty("$ref").GetString());
+        var page = document.GetProperty("components").GetProperty("schemas").GetProperty("ScheduleResponse");
+        CollectionAssert.AreEquivalent(new[] { "items", "continuationToken" },
+            page.GetProperty("required").EnumerateArray().Select(field => field.GetString()).ToArray());
+        var token = page.GetProperty("properties").GetProperty("continuationToken");
+        Assert.AreEqual("string", token.GetProperty("type").GetString());
+        Assert.IsTrue(token.GetProperty("nullable").GetBoolean());
+    }
+
+    private static void AssertProperties(JsonElement json, params string[] expected) =>
+        CollectionAssert.AreEquivalent(expected, json.EnumerateObject().Select(property => property.Name).ToArray());
+
+    private static HttpClient CreateAuthenticatedClient(ApiApplicationFactory factory)
+    {
+        var client = factory.CreateClient();
+        var token = factory.Services.GetRequiredService<AccessTokenService>()
+            .Create(new User { Id = UserId, Email = "client@club.test", Role = "user" });
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.AccessToken);
+        return client;
+    }
+
+    private sealed class ScheduleApplicationFactory(IScheduleService service) : ApiApplicationFactory
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureTestServices(services => services.AddSingleton(service));
+        }
+    }
+
+    private sealed class ScheduleServiceStub : IScheduleService
+    {
+        public ScheduleQuery? Query { get; private set; }
+        public long UserId { get; private set; }
+
+        public ScheduleResponse GetPage(ScheduleQuery query, long userId)
+        {
+            Query = query;
+            UserId = userId;
+            return new ScheduleResponse(
+                [new ScheduleItemResponse(1, "Yoga", query.From, 60, new ScheduleRoomResponse(2, "Studio"), 10, 7, 2)],
+                "next");
+        }
+    }
+}
