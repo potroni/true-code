@@ -16,7 +16,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<EnrollmentDetailsResponse>> GetDetails(
-        [FromRoute, Range(typeof(long), "1", "9223372036854775807")] long id,
+        [FromRoute] long id,
         CancellationToken ct)
     {
         var details = await enrollmentService.GetDetailsAsync(id, CurrentUserId, ct);
@@ -34,7 +34,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<EnrollmentDetailsResponse>> ChangeSeats(
-        [FromRoute, Range(typeof(long), "1", "9223372036854775807")] long id,
+        [FromRoute] long id,
         [FromRequiredBody, Required] ChangeSeatsRequest request,
         CancellationToken ct)
     {

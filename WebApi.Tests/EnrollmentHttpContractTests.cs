@@ -1,14 +1,17 @@
+using System.Data.Common;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using DataAccessLayer;
 using DataAccessLayer.Entities;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using WebApi.Auth;
@@ -101,8 +104,6 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    [DataRow("0")]
-    [DataRow("-1")]
     [DataRow("invalid")]
     [DataRow("9223372036854775808")]
     public async Task GetDetailsRejectsInvalidIdsBeforeCallingTheService(string id)
@@ -164,8 +165,6 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    [DataRow("0", """{"seats":2}""")]
-    [DataRow("-1", """{"seats":2}""")]
     [DataRow("invalid", """{"seats":2}""")]
     [DataRow("9223372036854775808", """{"seats":2}""")]
     [DataRow("42", null)]
@@ -264,6 +263,21 @@ public class EnrollmentHttpContractTests
         await AssertBookingNotFoundAsync(foreign);
         await AssertBookingNotFoundAsync(missing);
         await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 3);
+    }
+
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(-1)]
+    public async Task BookingRoutesReturnNotFoundForMissingNonPositiveIds(int id)
+    {
+        await using var factory = new ApiApplicationFactory();
+        using var client = CreateAuthenticatedClient(factory);
+
+        using var details = await client.GetAsync($"/enrollments/{id}");
+        using var change = await client.PostAsJsonAsync($"/enrollments/{id}/seats", new { seats = 2 });
+
+        await AssertBookingNotFoundAsync(details);
+        await AssertBookingNotFoundAsync(change);
     }
 
     [TestMethod]
@@ -1150,6 +1164,66 @@ public class EnrollmentHttpContractTests
         }
     }
 
+    [TestMethod]
+    public async Task SeatIncreaseUsesRequestDateWhenPassLockWaitCrossesUtcMidnight()
+    {
+        var requestedAt = new DateTimeOffset(2026, 11, 15, 23, 59, 59, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(requestedAt);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var validUntil = DateOnly.FromDateTime(requestedAt.UtcDateTime);
+        var userId = await AddBookingClientAsync(db, requestedAt.UtcDateTime, visits: 1, validUntil: validUntil);
+        var classId = await AddBookingClassAsync(db, requestedAt.UtcDateTime, capacity: 3);
+        var booking = await AddEnrollmentAsync(db, userId, classId, requestedAt.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
+        var pending = client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 3 }, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 1, ct);
+            clock.SetUtcNow(requestedAt.AddSeconds(1));
+            await gate.CommitAsync(ct);
+
+            using var response = await pending;
+            Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+            var details = await response.Content.ReadFromJsonAsync<EnrollmentDetailsResponse>(ct);
+            Assert.IsNotNull(details);
+            Assert.AreEqual((booking.Id, 3, 0, validUntil),
+                (details.Id, details.Seats, details.Pass.RemainingVisits, details.Pass.ValidUntil));
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 3, visits: 0);
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task SeatIncreaseRollsBackWhenReadingTheUpdatedCardFails()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var cardReadFailure = new BookingCardReadFailure();
+        await using var factory = new FixedTimeApplicationFactory(new AdjustableTimeProvider(now), cardReadFailure);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+
+        using var response = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 3 });
+
+        Assert.AreEqual(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.IsTrue(cardReadFailure.WasTriggered);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 1);
+    }
+
     private static async Task WaitForBlockedRequestsAsync(DbContext db, int expected, CancellationToken ct)
     {
         while (await db.Database.SqlQueryRaw<int>(
@@ -1269,7 +1343,8 @@ public class EnrollmentHttpContractTests
         }
     }
 
-    private sealed class FixedTimeApplicationFactory(TimeProvider clock) : ApiApplicationFactory
+    private sealed class FixedTimeApplicationFactory(TimeProvider clock, IInterceptor? interceptor = null)
+        : ApiApplicationFactory
     {
         public FixedTimeApplicationFactory(DateTimeOffset now) : this(new AdjustableTimeProvider(now)) { }
 
@@ -1277,7 +1352,30 @@ public class EnrollmentHttpContractTests
         {
             base.ConfigureWebHost(builder);
             builder.ConfigureTestServices(services =>
-                services.Replace(ServiceDescriptor.Singleton(clock)));
+            {
+                services.Replace(ServiceDescriptor.Singleton(clock));
+                if (interceptor is not null)
+                    services.ConfigureDbContext<ClubDbContext>(options => options.AddInterceptors(interceptor));
+            });
+        }
+    }
+
+    private sealed class BookingCardReadFailure : DbCommandInterceptor
+    {
+        public bool WasTriggered { get; private set; }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.Contains("JOIN passes ", StringComparison.Ordinal) &&
+                command.CommandText.Contains("JOIN rooms ", StringComparison.Ordinal))
+            {
+                WasTriggered = true;
+                throw new InvalidOperationException("Simulated booking card read failure.");
+            }
+
+            return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
         }
     }
 
