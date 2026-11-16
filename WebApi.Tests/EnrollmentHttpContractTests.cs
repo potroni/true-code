@@ -1701,9 +1701,9 @@ public partial class EnrollmentHttpContractTests
         return client;
     }
 
-    private static HttpRequestMessage CreateRequest(string? body, string? key)
+    private static HttpRequestMessage CreateRequest(string? body, string? key, string path = "/enrollments?userId=99")
     {
-        var request = new HttpRequestMessage(HttpMethod.Post, "/enrollments?userId=99");
+        var request = new HttpRequestMessage(HttpMethod.Post, path);
         if (body is not null)
         {
             request.Content = new StringContent(body, Encoding.UTF8, "application/json");
@@ -1777,6 +1777,17 @@ public partial class EnrollmentHttpContractTests
         public static readonly DateTimeOffset CreatedAt = new(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
 
         public (long UserId, long ClassId, int Seats, string Key)? Arguments { get; private set; }
+
+        public (long UserId, long ClassId, int Seats, string Key)? WaitlistArguments { get; private set; }
+
+        public JoinWaitlistResult WaitlistResult { get; init; } = new JoinWaitlistResult.PendingImplementation();
+
+        public Task<JoinWaitlistResult> JoinWaitlistAsync(
+            long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
+        {
+            WaitlistArguments = (userId, classId, seats, idempotencyKey);
+            return Task.FromResult(WaitlistResult);
+        }
 
         public (long EnrollmentId, long UserId)? DetailsArguments { get; private set; }
 

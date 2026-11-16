@@ -20,6 +20,9 @@ public interface IEnrollmentService
 
     Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
+
+    Task<JoinWaitlistResult> JoinWaitlistAsync(
+        long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
 }
 
 public abstract record CreateEnrollmentResult
@@ -36,6 +39,10 @@ public abstract record CreateEnrollmentResult
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
     private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
+
+    public Task<JoinWaitlistResult> JoinWaitlistAsync(
+        long userId, long classId, int seats, string idempotencyKey, CancellationToken ct) =>
+        Task.FromResult<JoinWaitlistResult>(new JoinWaitlistResult.PendingImplementation());
 
     public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)
     {

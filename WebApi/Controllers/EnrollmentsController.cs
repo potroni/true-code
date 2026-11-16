@@ -9,6 +9,32 @@ namespace WebApi.Controllers;
 [Route("enrollments")]
 public sealed class EnrollmentsController(IEnrollmentService enrollmentService) : BaseApiController
 {
+    [HttpPost("waitlist")]
+    [ProducesResponseType<JoinWaitlistResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status501NotImplemented)]
+    public async Task<ActionResult<JoinWaitlistResponse>> JoinWaitlist(
+        [FromRequiredBody, Required] JoinWaitlistRequest request,
+        [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
+        CancellationToken ct)
+    {
+        var result = await enrollmentService.JoinWaitlistAsync(
+            CurrentUserId, request.ClassId, request.Seats, idempotencyKey, ct);
+
+        return result switch
+        {
+            JoinWaitlistResult.Success success => StatusCode(StatusCodes.Status201Created, success.Response),
+            JoinWaitlistResult.ClassNotFound => Problem(statusCode: StatusCodes.Status404NotFound),
+            JoinWaitlistResult.Conflict conflict => ConflictWithReason(conflict.Reason),
+            JoinWaitlistResult.PendingImplementation => Problem(statusCode: StatusCodes.Status501NotImplemented),
+            _ => throw new InvalidOperationException("Unexpected waitlist result.")
+        };
+    }
+
     [HttpGet("{id}")]
     [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
