@@ -817,7 +817,9 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task CreateWaitsForKeyLockAndReplaysResponseAfterCommit()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task PostWaitsForKeyLockAndReplaysResponseAfterCommit(bool joinWaitlist)
     {
         await using var factory = new ApiApplicationFactory();
         await using var scope = factory.Services.CreateAsyncScope();
@@ -826,15 +828,17 @@ public partial class EnrollmentHttpContractTests
         var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
         var classId = await db.Set<Class>().Select(activity => activity.Id).FirstAsync();
         var key = Guid.NewGuid().ToString("N");
-        var storedBody =
-            $$"""{"status":"active", "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}""";
+        var storedBody = joinWaitlist
+            ? $$"""{"position":4, "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}"""
+            : $$"""{"status":"active", "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}""";
         using var client = CreateAuthenticatedClient(factory, userId);
-        using var request = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", key);
+        using var request = CreateRequest(
+            $$"""{"classId":{{classId}},"seats":2}""", key, joinWaitlist ? WaitlistPath : "/enrollments");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var ct = timeout.Token;
 
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        const IdempotencyOperation operation = IdempotencyOperation.CreateEnrollment;
+        var operation = joinWaitlist ? IdempotencyOperation.JoinWaitlist : IdempotencyOperation.CreateEnrollment;
         await unitOfWork.Idempotency.LockAsync(userId, operation, key, ct);
         unitOfWork.Idempotency.AddSuccess(userId, operation, key, classId, 2, storedBody);
         await unitOfWork.SaveChangesAsync(ct);

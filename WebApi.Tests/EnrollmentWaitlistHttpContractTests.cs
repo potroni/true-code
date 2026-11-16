@@ -2,6 +2,10 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
+using DataAccessLayer.Entities;
+using DataAccessLayer.UnitOfWork;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using WebApi.Contracts;
 using WebApi.Services;
 
@@ -17,7 +21,8 @@ public partial class EnrollmentHttpContractTests
         var createdAt = EnrollmentServiceStub.CreatedAt;
         var service = new EnrollmentServiceStub
         {
-            WaitlistResult = new JoinWaitlistResult.Success(new JoinWaitlistResponse(123, long.MaxValue, 2, 1, createdAt))
+            WaitlistResult = new JoinWaitlistResult.Success(JsonSerializer.Serialize(
+                new JoinWaitlistResponse(123, long.MaxValue, 2, 1, createdAt), JsonSerializerOptions.Web))
         };
         using var factory = new EnrollmentApplicationFactory(service);
         using var client = CreateAuthenticatedClient(factory);
@@ -172,5 +177,54 @@ public partial class EnrollmentHttpContractTests
 
         Assert.AreEqual(HttpStatusCode.NotImplemented, response.StatusCode);
         Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+    }
+
+    [TestMethod]
+    public async Task JoinWaitlistReplaysStoredPositionAndScopesTheKeyByUserAndOperation()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var users = await db.Set<User>().OrderBy(user => user.Id).Select(user => user.Id).Take(2).ToArrayAsync();
+        var classId = await db.Set<Class>().Select(activity => activity.Id).FirstAsync();
+        var key = Guid.NewGuid().ToString("N");
+        var storedBody =
+            $$"""{"id":123, "classId":{{classId}}, "seats":2, "position":7, "createdAt":"2026-11-15T08:00:00Z"}""";
+
+        await using (var transaction = await db.Database.BeginTransactionAsync())
+        {
+            unitOfWork.Idempotency.AddSuccess(
+                users[0], IdempotencyOperation.CreateEnrollment, key, classId, 1, "{}");
+            unitOfWork.Idempotency.AddSuccess(
+                users[0], IdempotencyOperation.JoinWaitlist, key, classId, 2, storedBody);
+            unitOfWork.Idempotency.AddSuccess(
+                users[1], IdempotencyOperation.JoinWaitlist, key, classId, 3, "{}");
+            await unitOfWork.SaveChangesAsync();
+            await transaction.CommitAsync();
+        }
+
+        using var client = CreateAuthenticatedClient(factory, users[0]);
+        using var replay = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", key, WaitlistPath);
+        using var replayResponse = await client.SendAsync(replay);
+        Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
+        Assert.AreEqual("application/json", replayResponse.Content.Headers.ContentType?.MediaType);
+        Assert.AreEqual(storedBody, await replayResponse.Content.ReadAsStringAsync());
+
+        foreach (var body in new[]
+        {
+            $$"""{"classId":{{classId}},"seats":3}""",
+            """{"classId":9223372036854775807,"seats":2}"""
+        })
+        {
+            using var conflict = CreateRequest(body, key, WaitlistPath);
+            using var conflictResponse = await client.SendAsync(conflict);
+            Assert.AreEqual(HttpStatusCode.Conflict, conflictResponse.StatusCode);
+            Assert.AreEqual("application/problem+json", conflictResponse.Content.Headers.ContentType?.MediaType);
+            var problem = await conflictResponse.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.AreEqual("idempotency-key-conflict", problem.GetProperty("reason").GetString());
+        }
+
+        Assert.AreEqual(3, await db.Set<IdempotencyEntry>().CountAsync(entry => entry.OriginalKey == key));
     }
 }

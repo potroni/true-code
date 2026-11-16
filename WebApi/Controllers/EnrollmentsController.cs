@@ -27,7 +27,12 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
 
         return result switch
         {
-            JoinWaitlistResult.Success success => StatusCode(StatusCodes.Status201Created, success.Response),
+            JoinWaitlistResult.Success success => new ContentResult
+            {
+                Content = success.ResponseBody,
+                ContentType = "application/json; charset=utf-8",
+                StatusCode = StatusCodes.Status201Created
+            },
             JoinWaitlistResult.ClassNotFound => Problem(statusCode: StatusCodes.Status404NotFound),
             JoinWaitlistResult.Conflict conflict => ConflictWithReason(conflict.Reason),
             JoinWaitlistResult.PendingImplementation => Problem(statusCode: StatusCodes.Status501NotImplemented),

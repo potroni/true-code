@@ -38,11 +38,21 @@ public abstract record CreateEnrollmentResult
 
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
-    private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
-
     public Task<JoinWaitlistResult> JoinWaitlistAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct) =>
-        Task.FromResult<JoinWaitlistResult>(new JoinWaitlistResult.PendingImplementation());
+        ExecuteIdempotentAsync<JoinWaitlistResult>(
+            userId, IdempotencyOperation.JoinWaitlist, idempotencyKey, classId, seats,
+            lookup => lookup.Status switch
+            {
+                IdempotencyLookupStatus.Replay when lookup.ResponseBody is { } body =>
+                    new JoinWaitlistResult.Success(body),
+                IdempotencyLookupStatus.ParameterConflict =>
+                    new JoinWaitlistResult.Conflict("idempotency-key-conflict"),
+                _ => throw new InvalidOperationException("Unexpected idempotency lookup result.")
+            },
+            () => Task.FromResult<(JoinWaitlistResult, string?)>(
+                (new JoinWaitlistResult.PendingImplementation(), null)),
+            ct);
 
     public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)
     {
@@ -279,21 +289,39 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
     {
         var requestedAt = timeProvider.GetUtcNow().UtcDateTime;
+        return await ExecuteIdempotentAsync<CreateEnrollmentResult>(
+            userId, IdempotencyOperation.CreateEnrollment, idempotencyKey, classId, seats, ToExistingResult,
+            async () =>
+            {
+                var (pass, rejection) = await CheckAvailabilityUnderLocksAsync(userId, classId, seats, requestedAt, ct);
+                if (rejection is not null)
+                    return (rejection, null);
+
+                var body = await SaveEnrollmentAsync(pass!, userId, classId, seats, requestedAt, ct);
+                return (new CreateEnrollmentResult.Success(body), body);
+            },
+            ct);
+    }
+
+    private async Task<TResult> ExecuteIdempotentAsync<TResult>(
+        long userId, IdempotencyOperation operation, string key, long classId, int seats,
+        Func<IdempotencyLookup, TResult> toExistingResult,
+        Func<Task<(TResult Result, string? ResponseBody)>> execute, CancellationToken ct)
+    {
         await using var transaction = await unitOfWork.DbContext.Database
             .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
 
         var journal = unitOfWork.Idempotency;
-        await journal.LockAsync(userId, Operation, idempotencyKey, ct);
+        await journal.LockAsync(userId, operation, key, ct);
         var lookup = await FindJournalEntryAsync();
         if (lookup.Status != IdempotencyLookupStatus.Missing)
-            return ToExistingResult(lookup);
+            return toExistingResult(lookup);
 
-        var (pass, rejection) = await CheckAvailabilityUnderLocksAsync(userId, classId, seats, requestedAt, ct);
-        if (rejection is not null)
-            return rejection;
+        var (result, responseBody) = await execute();
+        if (responseBody is null)
+            return result;
 
-        var responseBody = await SaveEnrollmentAsync(pass!, userId, classId, seats, requestedAt, ct);
-        journal.AddSuccess(userId, Operation, idempotencyKey, classId, seats, responseBody);
+        journal.AddSuccess(userId, operation, key, classId, seats, responseBody);
         try
         {
             await unitOfWork.SaveChangesAsync(ct);
@@ -306,14 +334,14 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         {
             await transaction.RollbackAsync(ct);
             unitOfWork.DbContext.ChangeTracker.Clear();
-            return ToExistingResult(await FindJournalEntryAsync());
+            return toExistingResult(await FindJournalEntryAsync());
         }
 
         await transaction.CommitAsync(ct);
-        return new CreateEnrollmentResult.Success(responseBody);
+        return result;
 
         Task<IdempotencyLookup> FindJournalEntryAsync() =>
-            journal.FindAsync(userId, Operation, idempotencyKey, classId, seats, ct);
+            journal.FindAsync(userId, operation, key, classId, seats, ct);
     }
 
     private async Task<(Pass? Pass, CreateEnrollmentResult? Rejection)> CheckAvailabilityUnderLocksAsync(

@@ -1,12 +1,10 @@
-using WebApi.Contracts;
-
 namespace WebApi.Services;
 
 public abstract record JoinWaitlistResult
 {
     private JoinWaitlistResult() { }
 
-    public sealed record Success(JoinWaitlistResponse Response) : JoinWaitlistResult;
+    public sealed record Success(string ResponseBody) : JoinWaitlistResult;
 
     public sealed record ClassNotFound : JoinWaitlistResult;
 
