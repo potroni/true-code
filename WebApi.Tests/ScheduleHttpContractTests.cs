@@ -38,6 +38,7 @@ public class ScheduleHttpContractTests
     [DataRow("?to=2026-09-22T13:00")]
     [DataRow("?from=2026-09-22T10:00")]
     [DataRow("?from=2026-09-22&to=2026-09-22T13:00")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T25:00")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T12:00%2B02:00")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T09:59")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&roomId=no")]
@@ -58,12 +59,13 @@ public class ScheduleHttpContractTests
     }
 
     [TestMethod]
-    [DataRow("", 20)]
-    [DataRow("&limit=1", 1)]
-    [DataRow("&limit=100", 100)]
-    public async Task ForwardsValidatedQueryAndJwtUserAndReturnsClosedResponse(string limit, int expectedLimit)
+    [DataRow("", 20, "next")]
+    [DataRow("&limit=1", 1, "next")]
+    [DataRow("&limit=100", 100, null)]
+    public async Task ForwardsValidatedQueryAndJwtUserAndReturnsClosedResponse(
+        string limit, int expectedLimit, string? nextToken)
     {
-        var service = new ScheduleServiceStub();
+        var service = new ScheduleServiceStub(nextToken);
         using var factory = new ScheduleApplicationFactory(service);
         using var client = CreateAuthenticatedClient(factory);
         var token = new ScheduleCursor(new DateTime(2026, 9, 22, 11, 0, 0, DateTimeKind.Utc), 1).Encode();
@@ -84,12 +86,26 @@ public class ScheduleHttpContractTests
 
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
         AssertProperties(json, "items", "continuationToken");
-        Assert.AreEqual("next", json.GetProperty("continuationToken").GetString());
+        var continuationToken = json.GetProperty("continuationToken");
+        if (nextToken is null)
+            Assert.AreEqual(JsonValueKind.Null, continuationToken.ValueKind);
+        else
+            Assert.AreEqual(nextToken, continuationToken.GetString());
+
         var item = json.GetProperty("items").EnumerateArray().Single();
         AssertProperties(item, "classId", "title", "startsAt", "durationMinutes", "room", "capacity",
             "freeSeats", "mySeats");
+        Assert.AreEqual(1L, item.GetProperty("classId").GetInt64());
+        Assert.AreEqual("Yoga", item.GetProperty("title").GetString());
         Assert.AreEqual("2026-09-22T10:00:00Z", item.GetProperty("startsAt").GetString());
-        AssertProperties(item.GetProperty("room"), "id", "name");
+        Assert.AreEqual(60, item.GetProperty("durationMinutes").GetInt32());
+        Assert.AreEqual(10, item.GetProperty("capacity").GetInt32());
+        Assert.AreEqual(7, item.GetProperty("freeSeats").GetInt32());
+        Assert.AreEqual(2, item.GetProperty("mySeats").GetInt32());
+        var room = item.GetProperty("room");
+        AssertProperties(room, "id", "name");
+        Assert.AreEqual(2L, room.GetProperty("id").GetInt64());
+        Assert.AreEqual("Studio", room.GetProperty("name").GetString());
     }
 
     [TestMethod]
@@ -176,7 +192,7 @@ public class ScheduleHttpContractTests
         }
     }
 
-    private sealed class ScheduleServiceStub : IScheduleService
+    private sealed class ScheduleServiceStub(string? nextToken) : IScheduleService
     {
         public ScheduleQuery? Query { get; private set; }
         public long UserId { get; private set; }
@@ -187,7 +203,7 @@ public class ScheduleHttpContractTests
             UserId = userId;
             return Task.FromResult(new ScheduleResponse(
                 [new ScheduleItemResponse(1, "Yoga", query.From, 60, new ScheduleRoomResponse(2, "Studio"), 10, 7, 2)],
-                "next"));
+                nextToken));
         }
     }
 }
