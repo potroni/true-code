@@ -1,5 +1,10 @@
 using System.Buffers.Binary;
+using DataAccessLayer;
+using DataAccessLayer.Entities;
+using DataAccessLayer.UnitOfWork;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using WebApi.Contracts;
 using WebApi.Services;
 
@@ -36,35 +41,81 @@ public class SchedulePaginationTests
     }
 
     [TestMethod]
-    public void PagesUseStrictPairOrderAndTokenFromLastReturnedItem()
+    public async Task PagesUseStrictPairOrderAndTokenFromLastReturnedItem()
     {
-        ScheduleItemResponse[] rows =
+        using var factory = new ApiApplicationFactory();
+        using var client = factory.CreateClient();
+        var commands = new List<string>();
+        var options = new DbContextOptionsBuilder<ClubDbContext>()
+            .UseNpgsql(TestDatabase.PostgresConnectionString)
+            .LogTo(commands.Add, [RelationalEventId.CommandExecuted])
+            .Options;
+        await using var db = new ClubDbContext(options);
+        var room = new Room { Name = "Schedule pagination studio" };
+        var user = new User
+        {
+            Email = "schedule-pagination@club.test",
+            PasswordHash = "unused",
+            Role = "user",
+            CreatedAt = Start
+        };
+        var startsAt = Start.AddTicks(-7);
+        Class[] classes =
         [
-            Item(3, Start), Item(1, Start.AddTicks(1)), Item(4, Start),
-            Item(2, Start), Item(6, Start.AddTicks(-1))
+            Item(startsAt.AddTicks(10)), Item(startsAt), Item(startsAt),
+            Item(startsAt), Item(startsAt.AddTicks(-10))
         ];
-        var items = rows.AsQueryable();
+        db.Add(user);
+        db.AddRange(classes);
+        await db.SaveChangesAsync();
+        db.Enrollments.Add(new Enrollment
+        {
+            ClassId = classes[1].Id,
+            UserId = user.Id,
+            Seats = 3,
+            Status = "active",
+            CreatedAt = startsAt.AddDays(-1)
+        });
+        await db.SaveChangesAsync();
+        commands.Clear();
 
-        var first = ScheduleService.BuildPage(items, new ScheduleQuery { Limit = 2 });
-        CollectionAssert.AreEqual(new long[] { 6, 2 }, first.Items.Select(item => item.ClassId).ToArray());
-        Assert.AreEqual(new ScheduleCursor(Start, 2).Encode(), first.ContinuationToken);
+        var service = new ScheduleService(new UnitOfWork(db));
+        var tiedIds = classes.Skip(1).Take(3).Select(item => item.Id).Order().ToArray();
+        var first = await ReadPage(2);
+        CollectionAssert.AreEqual(new[] { classes[4].Id, tiedIds[0] }, first.Items.Select(item => item.ClassId).ToArray());
+        Assert.AreEqual(new ScheduleCursor(startsAt, tiedIds[0]).Encode(), first.ContinuationToken);
+        var sql = commands.Single();
+        StringAssert.Contains(sql, "LIMIT");
+        StringAssert.Contains(sql, "sum(");
+        StringAssert.Contains(sql, "GREATEST(");
 
-        var second = ScheduleService.BuildPage(items,
-            new ScheduleQuery { Limit = 1, ContinuationToken = first.ContinuationToken });
-        Assert.AreEqual(3L, second.Items.Single().ClassId);
-        Assert.AreEqual(new ScheduleCursor(Start, 3).Encode(), second.ContinuationToken);
+        var second = await ReadPage(1, first.ContinuationToken);
+        Assert.AreEqual(tiedIds[1], second.Items.Single().ClassId);
+        Assert.AreEqual(new ScheduleCursor(startsAt, tiedIds[1]).Encode(), second.ContinuationToken);
 
-        var last = ScheduleService.BuildPage(items,
-            new ScheduleQuery { Limit = 2, ContinuationToken = second.ContinuationToken });
-        CollectionAssert.AreEqual(new long[] { 4, 1 }, last.Items.Select(item => item.ClassId).ToArray());
+        var last = await ReadPage(2, second.ContinuationToken);
+        CollectionAssert.AreEqual(new[] { tiedIds[2], classes[0].Id }, last.Items.Select(item => item.ClassId).ToArray());
         Assert.IsNull(last.ContinuationToken);
 
-        var empty = ScheduleService.BuildPage(items,
-            new ScheduleQuery { Limit = 2, ContinuationToken = new ScheduleCursor(Start.AddTicks(1), 1).Encode() });
+        var empty = await ReadPage(2, new ScheduleCursor(classes[0].StartsAt, classes[0].Id).Encode());
         Assert.AreEqual(0, empty.Items.Count);
         Assert.IsNull(empty.ContinuationToken);
-    }
+        var enrolled = first.Items.Concat(second.Items).Concat(last.Items).Single(x => x.ClassId == classes[1].Id);
+        Assert.AreEqual(7, enrolled.FreeSeats);
+        Assert.AreEqual(3, enrolled.MySeats);
+        Assert.AreEqual(new ScheduleRoomResponse(room.Id, room.Name), enrolled.Room);
 
-    private static ScheduleItemResponse Item(long id, DateTime startsAt) =>
-        new(id, "Yoga", startsAt, 60, new ScheduleRoomResponse(1, "Studio"), 10, 10, 0);
+        Task<ScheduleResponse> ReadPage(int limit, string? token = null) =>
+            service.GetPageAsync(new ScheduleQuery
+            {
+                From = startsAt.AddTicks(-10),
+                To = startsAt.AddTicks(20),
+                RoomId = room.Id,
+                Limit = limit,
+                ContinuationToken = token
+            }, user.Id, CancellationToken.None);
+
+        Class Item(DateTime start) =>
+            new() { Room = room, Title = "Yoga", StartsAt = start, DurationMinutes = 60, Capacity = 10 };
+    }
 }

@@ -97,7 +97,7 @@ public class ScheduleHttpContractTests
     {
         using var factory = new ApiApplicationFactory();
         using var client = CreateAuthenticatedClient(factory);
-        using var response = await client.GetAsync(ValidUrl);
+        using var response = await client.GetAsync(ValidUrl + $"&roomId={long.MaxValue}");
 
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
@@ -181,13 +181,13 @@ public class ScheduleHttpContractTests
         public ScheduleQuery? Query { get; private set; }
         public long UserId { get; private set; }
 
-        public ScheduleResponse GetPage(ScheduleQuery query, long userId)
+        public Task<ScheduleResponse> GetPageAsync(ScheduleQuery query, long userId, CancellationToken ct)
         {
             Query = query;
             UserId = userId;
-            return new ScheduleResponse(
+            return Task.FromResult(new ScheduleResponse(
                 [new ScheduleItemResponse(1, "Yoga", query.From, 60, new ScheduleRoomResponse(2, "Studio"), 10, 7, 2)],
-                "next");
+                "next"));
         }
     }
 }

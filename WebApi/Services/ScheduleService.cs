@@ -1,35 +1,30 @@
+using DataAccessLayer.UnitOfWork;
 using WebApi.Contracts;
 
 namespace WebApi.Services;
 
 public interface IScheduleService
 {
-    ScheduleResponse GetPage(ScheduleQuery query, long userId);
+    Task<ScheduleResponse> GetPageAsync(ScheduleQuery query, long userId, CancellationToken ct);
 }
 
-internal sealed class ScheduleService : IScheduleService
+internal sealed class ScheduleService(IUnitOfWork unitOfWork) : IScheduleService
 {
-    public ScheduleResponse GetPage(ScheduleQuery query, long userId) =>
-        BuildPage(Enumerable.Empty<ScheduleItemResponse>().AsQueryable(), query);
-
-    internal static ScheduleResponse BuildPage(IQueryable<ScheduleItemResponse> items, ScheduleQuery query)
+    public async Task<ScheduleResponse> GetPageAsync(ScheduleQuery query, long userId, CancellationToken ct)
     {
-        if (ScheduleCursor.TryDecode(query.ContinuationToken, out var cursor))
-        {
-            items = items.Where(item => item.StartsAt > cursor.StartsAt ||
-                (item.StartsAt == cursor.StartsAt && item.ClassId > cursor.ClassId));
-        }
+        (DateTime, long)? after = ScheduleCursor.TryDecode(query.ContinuationToken, out var cursor)
+            ? (cursor.StartsAt, cursor.ClassId)
+            : null;
+        var rows = await unitOfWork.Class.GetScheduleRowsAsync(
+            query.From, query.To, query.RoomId, userId, after, query.Limit + 1, ct);
 
-        var page = items.OrderBy(item => item.StartsAt)
-            .ThenBy(item => item.ClassId)
-            .Take(query.Limit + 1)
-            .ToList();
-
-        if (page.Count <= query.Limit)
-            return new ScheduleResponse(page, null);
-
-        page.RemoveAt(query.Limit);
-        var last = page[^1];
-        return new ScheduleResponse(page, new ScheduleCursor(last.StartsAt, last.ClassId).Encode());
+        var items = rows.Take(query.Limit)
+            .Select(row => new ScheduleItemResponse(row.ClassId, row.Title, row.StartsAt, row.DurationMinutes,
+                new ScheduleRoomResponse(row.RoomId, row.RoomName), row.Capacity, row.FreeSeats, row.MySeats))
+            .ToArray();
+        var next = rows.Count > query.Limit
+            ? new ScheduleCursor(items[^1].StartsAt, items[^1].ClassId).Encode()
+            : null;
+        return new ScheduleResponse(items, next);
     }
 }

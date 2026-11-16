@@ -13,6 +13,6 @@ public sealed class ScheduleController(IScheduleService scheduleService) : BaseA
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
-    public ActionResult<ScheduleResponse> Get([FromQuery] ScheduleQuery query) =>
-        Ok(scheduleService.GetPage(query, CurrentUserId));
+    public async Task<ActionResult<ScheduleResponse>> Get([FromQuery] ScheduleQuery query, CancellationToken ct) =>
+        Ok(await scheduleService.GetPageAsync(query, CurrentUserId, ct));
 }
