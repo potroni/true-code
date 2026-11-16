@@ -413,9 +413,10 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public async Task CreateRejectsClassThatStartsWhileWaitingForLock(bool blockPass)
+    [DataRow("class")]
+    [DataRow("pass")]
+    [DataRow("occupied seats")]
+    public async Task CreateRejectsClassThatStartsWhileCheckingAvailability(string blockedRead)
     {
         var now = new DateTimeOffset(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
         var clock = new AdjustableTimeProvider(now);
@@ -432,8 +433,10 @@ public class EnrollmentHttpContractTests
         var ct = timeout.Token;
 
         await using var gate = await db.Database.BeginTransactionAsync(ct);
-        if (blockPass)
+        if (blockedRead == "pass")
             Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
+        else if (blockedRead == "occupied seats")
+            await db.Database.ExecuteSqlRawAsync("LOCK TABLE enrollments IN ACCESS EXCLUSIVE MODE", ct);
         else
             Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
 
@@ -452,6 +455,50 @@ public class EnrollmentHttpContractTests
             Assert.IsFalse(await db.Set<IdempotencyEntry>().AnyAsync(entry => entry.OriginalKey == key, ct));
             Assert.AreEqual(1, await db.Set<Pass>().Where(pass => pass.UserId == userId)
                 .Select(pass => pass.RemainingVisits).SingleAsync(ct));
+        }
+        finally
+        {
+            if (!pendingResponse.IsCompleted)
+                await timeout.CancelAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task CreateUsesRequestDateWhenPassLockWaitCrossesUtcMidnight()
+    {
+        var requestedAt = new DateTimeOffset(2026, 11, 15, 23, 59, 59, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(requestedAt);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var userId = await AddBookingClientAsync(db, requestedAt.UtcDateTime, visits: 1,
+            validUntil: DateOnly.FromDateTime(requestedAt.UtcDateTime));
+        var classId = await AddBookingClassAsync(db, requestedAt.UtcDateTime, capacity: 1);
+        var key = Guid.NewGuid().ToString("N");
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var request = CreateRequest($$"""{"classId":{{classId}},"seats":1}""", key);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
+        var pendingResponse = client.SendAsync(request, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 1, ct);
+            clock.SetUtcNow(requestedAt.AddSeconds(1));
+            await gate.CommitAsync(ct);
+
+            using var response = await pendingResponse;
+            Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
+            var enrollment = await db.Set<Enrollment>().SingleAsync(entry => entry.ClassId == classId, ct);
+            Assert.AreEqual((userId, 1, "active"), (enrollment.UserId, enrollment.Seats, enrollment.Status));
+            Assert.AreEqual(0, await db.Set<Pass>().Where(pass => pass.UserId == userId)
+                .Select(pass => pass.RemainingVisits).SingleAsync(ct));
+            var journalBody = await db.Set<IdempotencyEntry>().Where(entry => entry.OriginalKey == key)
+                .Select(entry => entry.ResponseBody).SingleAsync(ct);
+            Assert.AreEqual(await response.Content.ReadAsStringAsync(ct), journalBody);
         }
         finally
         {
@@ -605,7 +652,8 @@ public class EnrollmentHttpContractTests
         }
     }
 
-    private static async Task<long> AddBookingClientAsync(DbContext db, DateTime now, int visits)
+    private static async Task<long> AddBookingClientAsync(
+        DbContext db, DateTime now, int visits, DateOnly? validUntil = null)
     {
         var user = new User
         {
@@ -620,7 +668,7 @@ public class EnrollmentHttpContractTests
         {
             UserId = user.Id,
             RemainingVisits = visits,
-            ValidUntil = DateOnly.FromDateTime(now).AddDays(1)
+            ValidUntil = validUntil ?? DateOnly.FromDateTime(now).AddDays(1)
         });
         await db.SaveChangesAsync();
         return user.Id;

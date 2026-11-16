@@ -81,11 +81,11 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             return (null, new CreateEnrollmentResult.Conflict("class-cancelled"));
 
         var pass = (await unitOfWork.Pass.LockByUsersAsync([userId], ct)).Single();
-        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
-            return (null, new CreateEnrollmentResult.Conflict("class-started"));
 
         // решение: очередь не резервирует места, чтобы доступность обычной брони определялась активными бронями.
         var occupiedSeats = await unitOfWork.Enrollment.SumActiveSeatsAsync(classId, ct);
+        if (activity.StartsAt <= timeProvider.GetUtcNow().UtcDateTime)
+            return (null, new CreateEnrollmentResult.Conflict("class-started"));
         if (activity.Capacity - occupiedSeats < seats)
             return (null, new CreateEnrollmentResult.Conflict("capacity-exceeded"));
 
