@@ -34,7 +34,8 @@ public class UnitOfWork : UnitOfWorkBase, IUnitOfWork
         GetRepository<Class, IClassRepository>(set => new ClassRepository(set, DbContext.Database));
 
     public IEnrollmentRepository Enrollment =>
-        GetRepository<Enrollment, IEnrollmentRepository>(set => new EnrollmentRepository(set));
+        GetRepository<Enrollment, IEnrollmentRepository>(
+            set => new EnrollmentRepository(set, DbContext.Set<Pass>()));
 
     public IPassRepository Pass =>
         GetRepository<Pass, IPassRepository>(set => new PassRepository(set, DbContext.Database));
