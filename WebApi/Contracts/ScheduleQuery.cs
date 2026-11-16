@@ -24,6 +24,7 @@ public sealed class ScheduleQuery : IValidatableObject
     public int Limit { get; init; } = 20;
 
     [FromQuery(Name = "continuationToken")]
+    [DisplayFormat(ConvertEmptyStringToNull = false)]
     public string? ContinuationToken { get; init; }
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
@@ -31,6 +32,11 @@ public sealed class ScheduleQuery : IValidatableObject
         if (To <= From)
         {
             yield return new ValidationResult("To must be later than from.", [nameof(To)]);
+        }
+
+        if (ContinuationToken is not null && !ScheduleCursor.TryDecode(ContinuationToken, out _))
+        {
+            yield return new ValidationResult("Invalid continuation token.", [nameof(ContinuationToken)]);
         }
     }
 }

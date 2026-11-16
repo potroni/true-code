@@ -44,6 +44,9 @@ public class ScheduleHttpContractTests
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=no")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=0")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=101")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&continuationToken=opaque")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&continuationToken=")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&continuationToken=%20")]
     public async Task InvalidQueryReturnsValidationProblem(string queryString)
     {
         using var factory = new ApiApplicationFactory();
@@ -63,8 +66,9 @@ public class ScheduleHttpContractTests
         var service = new ScheduleServiceStub();
         using var factory = new ScheduleApplicationFactory(service);
         using var client = CreateAuthenticatedClient(factory);
+        var token = new ScheduleCursor(new DateTime(2026, 9, 22, 11, 0, 0, DateTimeKind.Utc), 1).Encode();
         using var response = await client.GetAsync(
-            ValidUrl + "&roomId=4294967296&continuationToken=opaque&userId=99" + limit);
+            ValidUrl + $"&roomId=4294967296&continuationToken={token}&userId=99" + limit);
 
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         Assert.AreEqual(UserId, service.UserId);
@@ -76,7 +80,7 @@ public class ScheduleHttpContractTests
         Assert.AreEqual(DateTimeKind.Utc, query.To.Kind);
         Assert.AreEqual(4294967296L, query.RoomId);
         Assert.AreEqual(expectedLimit, query.Limit);
-        Assert.AreEqual("opaque", query.ContinuationToken);
+        Assert.AreEqual(token, query.ContinuationToken);
 
         var json = await response.Content.ReadFromJsonAsync<JsonElement>();
         AssertProperties(json, "items", "continuationToken");
