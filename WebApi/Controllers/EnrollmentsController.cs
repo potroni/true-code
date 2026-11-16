@@ -56,7 +56,6 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status501NotImplemented)]
     public async Task<ActionResult<CancelEnrollmentResponse>> Cancel(
         [FromRoute] long id,
         CancellationToken ct)
@@ -68,7 +67,6 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
             CancelEnrollmentResult.Success success => Ok(success.Response),
             CancelEnrollmentResult.NotFound => Problem(statusCode: StatusCodes.Status404NotFound),
             CancelEnrollmentResult.Conflict conflict => ConflictWithReason(conflict.Reason),
-            CancelEnrollmentResult.NotImplemented => Problem(statusCode: StatusCodes.Status501NotImplemented),
             _ => throw new InvalidOperationException("Unexpected enrollment cancellation result.")
         };
     }

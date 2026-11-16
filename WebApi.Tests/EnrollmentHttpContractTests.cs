@@ -225,7 +225,7 @@ public class EnrollmentHttpContractTests
         Assert.AreEqual("int64", id.GetProperty("schema").GetProperty("format").GetString());
 
         var responses = operation.GetProperty("responses");
-        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429", "501" },
+        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429" },
             responses.EnumerateObject().Select(response => response.Name).ToArray());
         var schema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
@@ -821,6 +821,65 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    [DataRow(121, false, false, 0, 2, null)]
+    [DataRow(120, false, false, 0, 2, null)]
+    [DataRow(119, false, false, 0, 0, null)]
+    [DataRow(0, false, false, 0, 0, "class-started")]
+    [DataRow(-1, true, false, 0, 2, null)]
+    [DataRow(-1, false, true, 0, 0, null)]
+    [DataRow(120, false, false, int.MaxValue, 0, "pass-balance-overflow")]
+    public async Task CancelPersistsAndReplaysTheApplicableRefund(
+        int minutesUntilStart, bool classCancelled, bool historicalCancellation,
+        int initialVisits, int refundedVisits, string? conflict)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, initialVisits,
+            DateOnly.FromDateTime(now.UtcDateTime).AddDays(-1));
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        var activity = await db.Set<Class>().SingleAsync(x => x.Id == classId);
+        activity.IsCancelled = classCancelled;
+        activity.StartsAt = now.UtcDateTime.AddMinutes(minutesUntilStart);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime.AddDays(-1),
+            historicalCancellation ? "cancelled" : "active");
+        if (historicalCancellation)
+        {
+            booking.RefundedVisits = 0;
+            await db.SaveChangesAsync();
+        }
+
+        using var client = CreateAuthenticatedClient(factory, userId);
+        var route = $"/enrollments/{booking.Id}/cancel";
+        using var response = await client.PostAsync(route, null);
+        if (conflict is not null)
+        {
+            Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.AreEqual(conflict, problem.GetProperty("reason").GetString());
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: initialVisits);
+            return;
+        }
+
+        using var repeat = await client.PostAsync(route, null);
+        foreach (var result in new[] { response, repeat })
+        {
+            Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
+            var body = await result.Content.ReadFromJsonAsync<JsonElement>();
+            Assert.AreEqual(booking.Id, body.GetProperty("id").GetInt64());
+            Assert.AreEqual("cancelled", body.GetProperty("status").GetString());
+            Assert.AreEqual(refundedVisits, body.GetProperty("refundedVisits").GetInt32());
+        }
+
+        var persisted = await db.Set<Enrollment>().AsNoTracking().SingleAsync(x => x.Id == booking.Id);
+        Assert.AreEqual("cancelled", persisted.Status);
+        Assert.AreEqual(refundedVisits, persisted.RefundedVisits);
+        Assert.AreEqual(historicalCancellation ? booking.CancelledAt : now.UtcDateTime, persisted.CancelledAt);
+        await AssertPersistedSeatsAndVisitsAsync(db, persisted, seats: 2, visits: initialVisits + refundedVisits);
+    }
+
+    [TestMethod]
     public async Task CreateReplaysOriginalResponseAfterResizeAndCancellation()
     {
         var requestTime = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
@@ -868,13 +927,11 @@ public class EnrollmentHttpContractTests
         await db.Entry(enrollment).ReloadAsync();
         await AssertReplayAsync(expectedVisits: 1);
 
-        var pass = await db.Set<Pass>().SingleAsync(entry => entry.UserId == userId);
-        await db.Entry(pass).ReloadAsync();
-        enrollment.Status = "cancelled";
-        enrollment.CancelledAt = now.AddMinutes(1);
-        enrollment.RefundedVisits = 2;
-        pass.RemainingVisits += 2;
-        await db.SaveChangesAsync();
+        using var cancelled = await client.PostAsync($"/enrollments/{booking.Id}/cancel", null);
+        Assert.AreEqual(HttpStatusCode.OK, cancelled.StatusCode);
+        var cancellation = await cancelled.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(2, cancellation.GetProperty("refundedVisits").GetInt32());
+        await db.Entry(enrollment).ReloadAsync();
         await AssertReplayAsync(expectedVisits: 3);
 
         async Task AssertReplayAsync(int expectedVisits)

@@ -171,6 +171,8 @@ public class BookingLocksTests
         Task<ChangeSeatsResult>? seatChange = null;
         try
         {
+            await change.DbContext.Database.OpenConnectionAsync(ct);
+            var requestPid = ((NpgsqlConnection)change.DbContext.Database.GetDbConnection()).ProcessID;
             await using var blockingTransaction = await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
             if (waitForClass)
             {
@@ -185,7 +187,7 @@ public class BookingLocksTests
 
             seatChange = service.ChangeSeatsAsync(enrollment.Id, enrollment.UserId, 3, ct);
             while (!seatChange.IsCompleted && !await db.Database.SqlQuery<bool>(
-                $"""SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS "Value" """)
+                $"""SELECT pg_backend_pid() = ANY(pg_blocking_pids({requestPid})) AS "Value" """)
                 .SingleAsync(ct))
             {
                 await Task.Delay(20, ct);
@@ -363,11 +365,13 @@ public class BookingLocksTests
             Assert.AreEqual(new CancelEnrollmentResult.NotFound(),
                 await service.CancelAsync(enrollment.Id, candidate.UserId, ct));
 
+            await cancellation.DbContext.Database.OpenConnectionAsync(ct);
+            var requestPid = ((NpgsqlConnection)cancellation.DbContext.Database.GetDbConnection()).ProcessID;
             await using var transaction = await db.Database.BeginTransactionAsync(ct);
             Assert.HasCount(1, await blocker.Pass.LockByUsersAsync([candidate.UserId], ct));
             request = service.CancelAsync(enrollment.Id, enrollment.UserId, ct);
             while (!request.IsCompleted && !await db.Database.SqlQuery<bool>(
-                $"""SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid))) AS "Value" """)
+                $"""SELECT pg_backend_pid() = ANY(pg_blocking_pids({requestPid})) AS "Value" """)
                 .SingleAsync(ct))
             {
                 await Task.Delay(20, ct);

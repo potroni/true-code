@@ -38,6 +38,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
 
     public async Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct)
     {
+        var requestedAt = timeProvider.GetUtcNow().UtcDateTime;
         await using var transaction = await unitOfWork.DbContext.Database
             .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
 
@@ -53,17 +54,45 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         if (enrollment is null || enrollment.ClassId != activity.Id)
             return new CancelEnrollmentResult.NotFound();
         if (enrollment.Status == "cancelled")
-            return new CancelEnrollmentResult.NotImplemented();
+            return new CancelEnrollmentResult.Success(
+                new CancelEnrollmentResponse(enrollment.Id, enrollment.RefundedVisits!.Value));
 
         // решение: для отмененного клубом занятия очередь не продвигаем и блокируем только абонемент владельца.
         var waiting = activity.IsCancelled ? [] : await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct);
         var passUserIds = waiting.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
-        await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
+        var passes = await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
 
-        if (!activity.IsCancelled && HasStarted(activity))
+        var cancelledAt = timeProvider.GetUtcNow().UtcDateTime;
+        if (!activity.IsCancelled && activity.StartsAt <= cancelledAt)
             return new CancelEnrollmentResult.Conflict("class-started");
 
-        return new CancelEnrollmentResult.NotImplemented();
+        var refundedVisits = activity.IsCancelled || activity.StartsAt - requestedAt >= TimeSpan.FromHours(2)
+            ? enrollment.Seats
+            : 0;
+        var pass = passes.Single(x => x.UserId == userId);
+        var remainingVisits = (long)pass.RemainingVisits + refundedVisits;
+        // решение: отклоняем отмену целиком, если полный возврат не помещается в int.
+        if (remainingVisits > int.MaxValue)
+            return new CancelEnrollmentResult.Conflict("pass-balance-overflow");
+
+        var enrollmentEntry = unitOfWork.DbContext.Attach(enrollment);
+        var passEntry = unitOfWork.DbContext.Attach(pass);
+        try
+        {
+            enrollment.Status = "cancelled";
+            enrollment.CancelledAt = cancelledAt;
+            enrollment.RefundedVisits = refundedVisits;
+            pass.RemainingVisits = (int)remainingVisits;
+            await unitOfWork.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+        }
+        finally
+        {
+            enrollmentEntry.State = EntityState.Detached;
+            passEntry.State = EntityState.Detached;
+        }
+
+        return new CancelEnrollmentResult.Success(new CancelEnrollmentResponse(enrollment.Id, refundedVisits));
     }
 
     public async Task<EnrollmentDetailsResponse?> GetDetailsAsync(
@@ -292,6 +321,4 @@ public abstract record CancelEnrollmentResult
     public sealed record NotFound : CancelEnrollmentResult;
 
     public sealed record Conflict(string Reason) : CancelEnrollmentResult;
-
-    public sealed record NotImplemented : CancelEnrollmentResult;
 }
