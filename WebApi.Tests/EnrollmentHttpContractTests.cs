@@ -817,7 +817,9 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task CreateWaitsForKeyLockAndReplaysResponseAfterCommit()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task PostWaitsForKeyLockAndReplaysResponseAfterCommit(bool joinWaitlist)
     {
         await using var factory = new ApiApplicationFactory();
         await using var scope = factory.Services.CreateAsyncScope();
@@ -826,15 +828,17 @@ public partial class EnrollmentHttpContractTests
         var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
         var classId = await db.Set<Class>().Select(activity => activity.Id).FirstAsync();
         var key = Guid.NewGuid().ToString("N");
-        var storedBody =
-            $$"""{"status":"active", "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}""";
+        var storedBody = joinWaitlist
+            ? $$"""{"position":4, "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}"""
+            : $$"""{"status":"active", "id":123, "classId":{{classId}}, "seats":2, "createdAt":"2026-11-15T08:00:00Z"}""";
         using var client = CreateAuthenticatedClient(factory, userId);
-        using var request = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", key);
+        using var request = CreateRequest(
+            $$"""{"classId":{{classId}},"seats":2}""", key, joinWaitlist ? WaitlistPath : "/enrollments");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var ct = timeout.Token;
 
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        const IdempotencyOperation operation = IdempotencyOperation.CreateEnrollment;
+        var operation = joinWaitlist ? IdempotencyOperation.JoinWaitlist : IdempotencyOperation.CreateEnrollment;
         await unitOfWork.Idempotency.LockAsync(userId, operation, key, ct);
         unitOfWork.Idempotency.AddSuccess(userId, operation, key, classId, 2, storedBody);
         await unitOfWork.SaveChangesAsync(ct);
@@ -1701,9 +1705,9 @@ public partial class EnrollmentHttpContractTests
         return client;
     }
 
-    private static HttpRequestMessage CreateRequest(string? body, string? key)
+    private static HttpRequestMessage CreateRequest(string? body, string? key, string path = "/enrollments?userId=99")
     {
-        var request = new HttpRequestMessage(HttpMethod.Post, "/enrollments?userId=99");
+        var request = new HttpRequestMessage(HttpMethod.Post, path);
         if (body is not null)
         {
             request.Content = new StringContent(body, Encoding.UTF8, "application/json");
@@ -1777,6 +1781,27 @@ public partial class EnrollmentHttpContractTests
         public static readonly DateTimeOffset CreatedAt = new(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
 
         public (long UserId, long ClassId, int Seats, string Key)? Arguments { get; private set; }
+
+        public (long UserId, long ClassId, int Seats, string Key)? WaitlistArguments { get; private set; }
+
+        public JoinWaitlistResult WaitlistResult { get; init; } = new JoinWaitlistResult.ClassNotFound();
+
+        public (long Id, long UserId)? WaitlistCancellationArguments { get; private set; }
+
+        public CancelWaitlistResult WaitlistCancellationResult { get; init; } = new CancelWaitlistResult.NotFound();
+
+        public Task<CancelWaitlistResult> CancelWaitlistAsync(long id, long userId, CancellationToken ct)
+        {
+            WaitlistCancellationArguments = (id, userId);
+            return Task.FromResult(WaitlistCancellationResult);
+        }
+
+        public Task<JoinWaitlistResult> JoinWaitlistAsync(
+            long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
+        {
+            WaitlistArguments = (userId, classId, seats, idempotencyKey);
+            return Task.FromResult(WaitlistResult);
+        }
 
         public (long EnrollmentId, long UserId)? DetailsArguments { get; private set; }
 

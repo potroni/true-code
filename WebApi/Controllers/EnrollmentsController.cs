@@ -9,6 +9,55 @@ namespace WebApi.Controllers;
 [Route("enrollments")]
 public sealed class EnrollmentsController(IEnrollmentService enrollmentService) : BaseApiController
 {
+    [HttpPost("waitlist")]
+    [ProducesResponseType<JoinWaitlistResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<JoinWaitlistResponse>> JoinWaitlist(
+        [FromRequiredBody, Required] JoinWaitlistRequest request,
+        [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
+        CancellationToken ct)
+    {
+        var result = await enrollmentService.JoinWaitlistAsync(
+            CurrentUserId, request.ClassId, request.Seats, idempotencyKey, ct);
+
+        return result switch
+        {
+            JoinWaitlistResult.Success success => new ContentResult
+            {
+                Content = success.ResponseBody,
+                ContentType = "application/json; charset=utf-8",
+                StatusCode = StatusCodes.Status201Created
+            },
+            JoinWaitlistResult.ClassNotFound => Problem(statusCode: StatusCodes.Status404NotFound),
+            JoinWaitlistResult.Conflict conflict => ConflictWithReason(conflict.Reason),
+            _ => throw new InvalidOperationException("Unexpected waitlist result.")
+        };
+    }
+
+    [HttpPost("waitlist/{id}/cancel")]
+    [ProducesResponseType<CancelWaitlistResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<CancelWaitlistResponse>> CancelWaitlist([FromRoute] long id, CancellationToken ct)
+    {
+        var result = await enrollmentService.CancelWaitlistAsync(id, CurrentUserId, ct);
+
+        return result switch
+        {
+            CancelWaitlistResult.Success success => Ok(success.Response),
+            CancelWaitlistResult.NotFound => Problem(statusCode: StatusCodes.Status404NotFound),
+            CancelWaitlistResult.Conflict conflict => ConflictWithReason(conflict.Reason),
+            _ => throw new InvalidOperationException("Unexpected waitlist cancellation result.")
+        };
+    }
+
     [HttpGet("{id}")]
     [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
