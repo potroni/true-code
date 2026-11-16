@@ -16,7 +16,6 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType(StatusCodes.Status501NotImplemented)]
     public async Task<ActionResult<EnrollmentResponse>> Create(
         [FromRequiredBody] ClassSeatsRequest request,
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
@@ -35,7 +34,6 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
             },
             CreateEnrollmentResult.ClassNotFound => Problem(statusCode: StatusCodes.Status404NotFound),
             CreateEnrollmentResult.Conflict conflict => ConflictWithReason(conflict.Reason),
-            CreateEnrollmentResult.NotImplemented => Problem(statusCode: StatusCodes.Status501NotImplemented),
             _ => throw new InvalidOperationException("Unexpected enrollment result.")
         };
     }

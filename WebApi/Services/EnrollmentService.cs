@@ -1,8 +1,11 @@
 using System.Data;
+using System.Text.Json;
 using DataAccessLayer.Entities;
 using DataAccessLayer.Repositories;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using WebApi.Contracts;
 
 namespace WebApi.Services;
 
@@ -21,12 +24,12 @@ public abstract record CreateEnrollmentResult
     public sealed record ClassNotFound : CreateEnrollmentResult;
 
     public sealed record Conflict(string Reason) : CreateEnrollmentResult;
-
-    public sealed record NotImplemented : CreateEnrollmentResult;
 }
 
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
+    private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
+
     public async Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
     {
@@ -34,23 +37,39 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         await using var transaction = await unitOfWork.DbContext.Database
             .BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
 
-        const IdempotencyOperation operation = IdempotencyOperation.CreateEnrollment;
         var journal = unitOfWork.Idempotency;
-        await journal.LockAsync(userId, operation, idempotencyKey, ct);
-        var lookup = await journal.FindAsync(userId, operation, idempotencyKey, classId, seats, ct);
+        await journal.LockAsync(userId, Operation, idempotencyKey, ct);
+        var lookup = await journal.FindAsync(userId, Operation, idempotencyKey, classId, seats, ct);
+        if (lookup.Status != IdempotencyLookupStatus.Missing)
+            return ToExistingResult(lookup);
 
-        return lookup.Status switch
+        var result = await CreateUnderLocksAsync(userId, classId, seats, requestedAt, ct);
+        if (result is not CreateEnrollmentResult.Success success)
+            return result;
+
+        journal.AddSuccess(userId, Operation, idempotencyKey, classId, seats, success.ResponseBody);
+        try
         {
-            IdempotencyLookupStatus.Replay when lookup.ResponseBody is { } body =>
-                new CreateEnrollmentResult.Success(body),
-            IdempotencyLookupStatus.ParameterConflict =>
-                new CreateEnrollmentResult.Conflict("idempotency-key-conflict"),
-            IdempotencyLookupStatus.Missing => await CheckAvailabilityAsync(userId, classId, seats, requestedAt, ct),
-            _ => throw new InvalidOperationException("Unexpected idempotency lookup result.")
-        };
+            await unitOfWork.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException exception) when (exception.InnerException is PostgresException
+        {
+            SqlState: PostgresErrorCodes.UniqueViolation,
+            ConstraintName: "ux_idempotency_entries_user_operation_hash"
+        })
+        {
+            await transaction.RollbackAsync(ct);
+            unitOfWork.DbContext.ChangeTracker.Clear();
+
+            var winner = await journal.FindAsync(userId, Operation, idempotencyKey, classId, seats, ct);
+            return ToExistingResult(winner);
+        }
+
+        await transaction.CommitAsync(ct);
+        return success;
     }
 
-    private async Task<CreateEnrollmentResult> CheckAvailabilityAsync(
+    private async Task<CreateEnrollmentResult> CreateUnderLocksAsync(
         long userId, long classId, int seats, DateTime requestedAt, CancellationToken ct)
     {
         var activity = await unitOfWork.Class.LockByIdAsync(classId, ct);
@@ -71,6 +90,31 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         if (pass.ValidUntil < DateOnly.FromDateTime(requestedAt))
             return new CreateEnrollmentResult.Conflict("pass-expired");
 
-        return new CreateEnrollmentResult.NotImplemented();
+        var enrollment = new Enrollment
+        {
+            UserId = userId,
+            ClassId = classId,
+            Seats = seats,
+            Status = "active",
+            // решение: усекаем время до микросекунд для совпадения ответа со значением из PostgreSQL.
+            CreatedAt = requestedAt.AddTicks(-(requestedAt.Ticks % TimeSpan.TicksPerMicrosecond))
+        };
+        await unitOfWork.Enrollment.CreateAsync(enrollment, ct);
+        unitOfWork.DbContext.Attach(pass);
+        pass.RemainingVisits -= seats;
+        await unitOfWork.SaveChangesAsync(ct);
+
+        var response = new EnrollmentResponse(
+            enrollment.Id, enrollment.ClassId, enrollment.Seats, enrollment.Status, enrollment.CreatedAt);
+        return new CreateEnrollmentResult.Success(JsonSerializer.Serialize(response, JsonSerializerOptions.Web));
     }
+
+    private static CreateEnrollmentResult ToExistingResult(IdempotencyLookup lookup) => lookup.Status switch
+    {
+        IdempotencyLookupStatus.Replay when lookup.ResponseBody is { } body =>
+            new CreateEnrollmentResult.Success(body),
+        IdempotencyLookupStatus.ParameterConflict =>
+            new CreateEnrollmentResult.Conflict("idempotency-key-conflict"),
+        _ => throw new InvalidOperationException("Unexpected idempotency lookup result.")
+    };
 }

@@ -113,11 +113,14 @@ public class EnrollmentHttpContractTests
     [DataRow("available", 3, HttpStatusCode.Conflict, "capacity-exceeded")]
     [DataRow("exhausted-pass", 2, HttpStatusCode.Conflict, "pass-exhausted")]
     [DataRow("expired-pass", 2, HttpStatusCode.Conflict, "pass-expired")]
-    [DataRow("available", 2, HttpStatusCode.NotImplemented, null)]
-    public async Task CreateChecksAvailabilityWithoutChangingDatabaseState(
+    [DataRow("available", 2, HttpStatusCode.Created, null)]
+    [DataRow("journal-replay", 2, HttpStatusCode.Created, null)]
+    [DataRow("journal-conflict", 2, HttpStatusCode.Conflict, "idempotency-key-conflict")]
+    public async Task CreateAppliesAvailabilityAndIdempotencyRulesAtomically(
         string scenario, int seats, HttpStatusCode expectedStatus, string? expectedReason)
     {
-        var now = new DateTimeOffset(2026, 11, 15, 23, 59, 59, TimeSpan.Zero);
+        var storedTime = new DateTimeOffset(2026, 11, 15, 23, 59, 59, TimeSpan.Zero).AddTicks(1234560);
+        var now = scenario == "started-class" ? storedTime : storedTime.AddTicks(7);
         await using var factory = new FixedTimeApplicationFactory(now);
         await using var scope = factory.Services.CreateAsyncScope();
         var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
@@ -172,21 +175,95 @@ public class EnrollmentHttpContractTests
         var key = Guid.NewGuid().ToString("N");
         using var client = CreateAuthenticatedClient(factory, user.Id);
         using var request = CreateRequest($$"""{"classId":{{classId}},"seats":{{seats}}}""", key);
-        using var response = await client.SendAsync(request);
+        var winnerSeats = scenario == "journal-conflict" ? seats - 1 : seats;
+        var winnerBody = $$"""{"id":123,"classId":{{classId}},"seats":{{winnerSeats}},"status":"active","createdAt":"2026-11-15T08:00:00Z"}""";
+        var simulateIndexConflict = scenario is "journal-replay" or "journal-conflict";
+        using var response = simulateIndexConflict
+            ? await SendWithRacingJournalInsertAsync(unitOfWork, client, request, user.Id, classId, key,
+                winnerSeats, winnerBody)
+            : await client.SendAsync(request);
 
         Assert.AreEqual(expectedStatus, response.StatusCode);
-        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.AreEqual(expectedStatus == HttpStatusCode.Created ? "application/json" : "application/problem+json",
+            response.Content.Headers.ContentType?.MediaType);
         if (expectedReason is not null)
         {
             var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
             Assert.AreEqual(expectedReason, problem.GetProperty("reason").GetString());
         }
 
-        Assert.AreEqual(remainingVisits, await db.Set<Pass>().Where(pass => pass.UserId == user.Id)
+        var created = scenario == "available" && expectedStatus == HttpStatusCode.Created;
+        Assert.AreEqual(created ? 0 : remainingVisits, await db.Set<Pass>().Where(pass => pass.UserId == user.Id)
             .Select(pass => pass.RemainingVisits).SingleAsync());
-        Assert.AreEqual(2, await db.Set<Enrollment>().CountAsync(enrollment => enrollment.UserId == user.Id));
-        Assert.AreEqual(2L, await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id));
-        Assert.IsFalse(await db.Set<IdempotencyEntry>().AnyAsync(entry => entry.OriginalKey == key));
+        Assert.AreEqual(created ? 3 : 2, await db.Set<Enrollment>()
+            .CountAsync(enrollment => enrollment.UserId == user.Id));
+        Assert.AreEqual(created ? 4L : 2L, await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id));
+        var journalBody = await db.Set<IdempotencyEntry>().Where(entry => entry.OriginalKey == key)
+            .Select(entry => entry.ResponseBody).SingleOrDefaultAsync();
+
+        if (created)
+        {
+            var body = await response.Content.ReadAsStringAsync();
+            Assert.AreEqual(body, journalBody);
+            var enrollment = await db.Set<Enrollment>().AsNoTracking()
+                .Where(entry => entry.UserId == user.Id && entry.Status == "active")
+                .OrderByDescending(entry => entry.Id).FirstAsync();
+            Assert.AreEqual(storedTime.UtcDateTime, enrollment.CreatedAt);
+            var expected = new EnrollmentResponse(enrollment.Id, classId, seats, "active", storedTime);
+            Assert.AreEqual(expected, JsonSerializer.Deserialize<EnrollmentResponse>(body, JsonSerializerOptions.Web));
+
+            using var replay = CreateRequest($$"""{"classId":{{classId}},"seats":{{seats}}}""", key);
+            using var replayResponse = await client.SendAsync(replay);
+            Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
+            Assert.AreEqual(body, await replayResponse.Content.ReadAsStringAsync());
+        }
+        else if (simulateIndexConflict)
+        {
+            Assert.AreEqual(winnerBody, journalBody);
+            if (expectedStatus == HttpStatusCode.Created)
+                Assert.AreEqual(winnerBody, await response.Content.ReadAsStringAsync());
+        }
+        else
+        {
+            Assert.IsNull(journalBody);
+        }
+    }
+
+    private static async Task<HttpResponseMessage> SendWithRacingJournalInsertAsync(
+        IUnitOfWork unitOfWork, HttpClient client, HttpRequestMessage request,
+        long userId, long classId, string key, int winnerSeats, string winnerBody)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+        var db = unitOfWork.DbContext;
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+        var pendingResponse = client.SendAsync(request, ct);
+        try
+        {
+            while (!await db.Database.SqlQueryRaw<bool>(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_locks
+                    WHERE NOT granted AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                ) AS "Value"
+                """).SingleAsync(ct))
+            {
+                Assert.IsFalse(pendingResponse.IsCompleted, "The HTTP request did not wait for the class lock.");
+                await Task.Delay(20, ct);
+            }
+
+            unitOfWork.Idempotency.AddSuccess(
+                userId, IdempotencyOperation.CreateEnrollment, key, classId, winnerSeats, winnerBody);
+            await unitOfWork.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+            return await pendingResponse;
+        }
+        finally
+        {
+            if (!pendingResponse.IsCompleted)
+                await timeout.CancelAsync();
+        }
     }
 
     [TestMethod]
