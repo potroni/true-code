@@ -9,6 +9,23 @@ namespace WebApi.Controllers;
 [Route("enrollments")]
 public sealed class EnrollmentsController(IEnrollmentService enrollmentService) : BaseApiController
 {
+    [HttpGet("{id}")]
+    [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<EnrollmentDetailsResponse>> GetDetails(
+        [FromRoute, Range(typeof(long), "1", "9223372036854775807")] long id,
+        CancellationToken ct)
+    {
+        var details = await enrollmentService.GetDetailsAsync(id, CurrentUserId, ct);
+        if (details is null)
+            return Problem(statusCode: StatusCodes.Status404NotFound);
+
+        return Ok(details);
+    }
+
     [HttpPost]
     [ProducesResponseType<EnrollmentResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]

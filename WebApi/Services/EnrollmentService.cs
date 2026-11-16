@@ -11,6 +11,8 @@ namespace WebApi.Services;
 
 public interface IEnrollmentService
 {
+    Task<EnrollmentDetailsResponse?> GetDetailsAsync(long enrollmentId, long userId, CancellationToken ct);
+
     Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
 }
@@ -29,6 +31,28 @@ public abstract record CreateEnrollmentResult
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
     private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
+
+    public async Task<EnrollmentDetailsResponse?> GetDetailsAsync(
+        long enrollmentId, long userId, CancellationToken ct)
+    {
+        var details = await unitOfWork.Enrollment.GetDetailsAsync(enrollmentId, userId, ct);
+        if (details is null)
+            return null;
+
+        return new EnrollmentDetailsResponse(
+            details.Id,
+            details.Status,
+            details.Seats,
+            details.CreatedAt,
+            new EnrollmentClassResponse(
+                details.ClassId,
+                details.ClassTitle,
+                details.StartsAt,
+                details.DurationMinutes,
+                details.IsClassCancelled,
+                new EnrollmentRoomResponse(details.RoomId, details.RoomName)),
+            new EnrollmentPassResponse(details.RemainingVisits, details.ValidUntil));
+    }
 
     public async Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)

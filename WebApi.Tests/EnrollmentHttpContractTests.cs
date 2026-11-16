@@ -6,6 +6,7 @@ using System.Text.Json;
 using DataAccessLayer.Entities;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -21,6 +22,119 @@ public class EnrollmentHttpContractTests
 {
     private const long UserId = 17;
     private const string ValidBody = """{"classId":42,"seats":2,"userId":99}""";
+
+    [TestMethod]
+    [DataRow("active", false)]
+    [DataRow("cancelled", true)]
+    public async Task GetDetailsReturnsTheOwnedBookingWithCurrentPass(string status, bool classCancelled)
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var now = new DateTime(2026, 11, 16, 8, 0, 0, DateTimeKind.Utc);
+        var validUntil = DateOnly.FromDateTime(now).AddDays(1);
+        var userId = await AddBookingClientAsync(db, now, visits: 5, validUntil: validUntil);
+        var otherUserId = await AddBookingClientAsync(db, now, visits: 5);
+        var classId = await AddBookingClassAsync(db, now, capacity: 10);
+        var activity = await db.Set<Class>().Include(x => x.Room).SingleAsync(x => x.Id == classId);
+        activity.IsCancelled = classCancelled;
+        var enrollment = new Enrollment
+        {
+            UserId = userId,
+            ClassId = classId,
+            Seats = 2,
+            Status = status,
+            CreatedAt = now,
+            CancelledAt = status == "cancelled" ? now.AddHours(1) : null,
+            RefundedVisits = status == "cancelled" ? 2 : null
+        };
+        db.Add(enrollment);
+        await db.SaveChangesAsync();
+
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var response = await client.GetAsync($"/enrollments/{enrollment.Id}?userId={otherUserId}");
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(enrollment.Id, body.GetProperty("id").GetInt64());
+        Assert.AreEqual(status, body.GetProperty("status").GetString());
+        Assert.AreEqual(2, body.GetProperty("seats").GetInt32());
+        var createdAt = body.GetProperty("createdAt").GetDateTimeOffset();
+        Assert.AreEqual(new DateTimeOffset(now), createdAt);
+        Assert.AreEqual(TimeSpan.Zero, createdAt.Offset);
+        var classBody = body.GetProperty("class");
+        Assert.AreEqual(classId, classBody.GetProperty("id").GetInt64());
+        Assert.AreEqual(activity.Title, classBody.GetProperty("title").GetString());
+        var startsAt = classBody.GetProperty("startsAt").GetDateTimeOffset();
+        Assert.AreEqual(new DateTimeOffset(activity.StartsAt), startsAt);
+        Assert.AreEqual(TimeSpan.Zero, startsAt.Offset);
+        Assert.AreEqual(activity.DurationMinutes, classBody.GetProperty("durationMinutes").GetInt32());
+        Assert.AreEqual(classCancelled, classBody.GetProperty("isCancelled").GetBoolean());
+        var room = classBody.GetProperty("room");
+        Assert.AreEqual(activity.Room.Id, room.GetProperty("id").GetInt64());
+        Assert.AreEqual(activity.Room.Name, room.GetProperty("name").GetString());
+        var pass = body.GetProperty("pass");
+        Assert.AreEqual(5, pass.GetProperty("remainingVisits").GetInt32());
+        Assert.AreEqual("2026-11-17", pass.GetProperty("validUntil").GetString());
+
+        using var otherClient = CreateAuthenticatedClient(factory, otherUserId);
+        using var foreign = await otherClient.GetAsync($"/enrollments/{enrollment.Id}?userId={userId}");
+        using var missing = await otherClient.GetAsync($"/enrollments/{long.MaxValue}");
+        foreach (var notFound in new[] { foreign, missing })
+        {
+            Assert.AreEqual(HttpStatusCode.NotFound, notFound.StatusCode);
+            Assert.AreEqual("application/problem+json", notFound.Content.Headers.ContentType?.MediaType);
+            var problem = await notFound.Content.ReadFromJsonAsync<ProblemDetails>();
+            Assert.IsNotNull(problem);
+            Assert.AreEqual(404, problem.Status);
+            Assert.IsNull(problem.Detail);
+        }
+    }
+
+    [TestMethod]
+    [DataRow("0")]
+    [DataRow("-1")]
+    [DataRow("invalid")]
+    [DataRow("9223372036854775808")]
+    public async Task GetDetailsRejectsInvalidIdsBeforeCallingTheService(string id)
+    {
+        var service = new EnrollmentServiceStub();
+        using var factory = new EnrollmentApplicationFactory(service);
+        using var client = CreateAuthenticatedClient(factory);
+        using var response = await client.GetAsync($"/enrollments/{id}");
+        Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        Assert.IsNull(service.DetailsArguments);
+    }
+
+    [TestMethod]
+    public async Task GetDetailsRequiresJwt()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+        using var response = await client.GetAsync("/enrollments/1");
+        Assert.AreEqual(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [TestMethod]
+    public async Task GetDetailsDocumentsItsContractInOpenApi()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var operation = document.GetProperty("paths").GetProperty("/enrollments/{id}").GetProperty("get");
+        var id = operation.GetProperty("parameters")[0];
+        Assert.AreEqual("id", id.GetProperty("name").GetString());
+        Assert.AreEqual("path", id.GetProperty("in").GetString());
+        Assert.IsTrue(id.GetProperty("required").GetBoolean());
+        Assert.AreEqual("int64", id.GetProperty("schema").GetProperty("format").GetString());
+
+        var responses = operation.GetProperty("responses");
+        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "429" },
+            responses.EnumerateObject().Select(response => response.Name).ToArray());
+        var schema = responses.GetProperty("200").GetProperty("content")
+            .GetProperty("application/json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/EnrollmentDetailsResponse", schema.GetProperty("$ref").GetString());
+    }
 
     [TestMethod]
     public async Task CreateUsesJwtIdentityAndReturnsTheCreatedContract()
@@ -104,6 +218,25 @@ public class EnrollmentHttpContractTests
         using var rejectedRequest = CreateRequest(ValidBody, "key");
         using var rejected = await client.SendAsync(rejectedRequest);
         Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+    }
+
+    [TestMethod]
+    public async Task GetDetailsSharesTheBusinessRateLimitWithCreate()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = CreateAuthenticatedClient(factory);
+
+        for (var index = 0; index < 60; index++)
+        {
+            using var response = await client.GetAsync("/enrollments/1");
+            Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
+        }
+
+        using var request = CreateRequest(ValidBody, "key");
+        using var rejected = await client.SendAsync(request);
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, rejected.StatusCode);
+        using var rejectedGet = await client.GetAsync("/enrollments/1");
+        Assert.AreEqual(HttpStatusCode.TooManyRequests, rejectedGet.StatusCode);
     }
 
     [TestMethod]
@@ -750,6 +883,15 @@ public class EnrollmentHttpContractTests
         public static readonly DateTimeOffset CreatedAt = new(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
 
         public (long UserId, long ClassId, int Seats, string Key)? Arguments { get; private set; }
+
+        public (long EnrollmentId, long UserId)? DetailsArguments { get; private set; }
+
+        public Task<EnrollmentDetailsResponse?> GetDetailsAsync(
+            long enrollmentId, long userId, CancellationToken ct)
+        {
+            DetailsArguments = (enrollmentId, userId);
+            return Task.FromResult<EnrollmentDetailsResponse?>(null);
+        }
 
         public Task<CreateEnrollmentResult> CreateAsync(
             long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
