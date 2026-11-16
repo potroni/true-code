@@ -982,6 +982,174 @@ public class EnrollmentHttpContractTests
         }
     }
 
+    [TestMethod]
+    public async Task ConcurrentSeatChangesToTheSameTotalOnlyChargeOnce()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+        var path = $"/enrollments/{booking.Id}/seats";
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+        var firstPending = client.PostAsJsonAsync(path, new { seats = 3 }, ct);
+        var secondPending = client.PostAsJsonAsync(path, new { seats = 3 }, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 2, ct);
+            await gate.CommitAsync(ct);
+
+            using var first = await firstPending;
+            using var second = await secondPending;
+            foreach (var response in new[] { first, second })
+            {
+                Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+                var details = await response.Content.ReadFromJsonAsync<EnrollmentDetailsResponse>(ct);
+                Assert.IsNotNull(details);
+                Assert.AreEqual((booking.Id, 3, 0), (details.Id, details.Seats, details.Pass.RemainingVisits));
+            }
+
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 3, visits: 0);
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+        }
+    }
+
+    [TestMethod]
+    [DataRow(true, "capacity-exceeded")]
+    [DataRow(false, "pass-exhausted")]
+    public async Task SeatIncreaseAndCreationCompeteForOneUnit(bool sameClass, string rejectionReason)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var ownerId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var creatorId = sameClass ? await AddBookingClientAsync(db, now.UtcDateTime, visits: 1) : ownerId;
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var createClassId = sameClass ? classId : await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var booking = await AddEnrollmentAsync(db, ownerId, classId, now.UtcDateTime);
+        var key = Guid.NewGuid().ToString("N");
+        using var owner = CreateAuthenticatedClient(factory, ownerId);
+        using var creator = CreateAuthenticatedClient(factory, creatorId);
+        using var createRequest = CreateRequest($$"""{"classId":{{createClassId}},"seats":1}""", key);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        if (sameClass)
+            Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+        else
+            Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([ownerId], ct));
+
+        var changePending = owner.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 3 }, ct);
+        var createPending = creator.SendAsync(createRequest, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 2, ct);
+            await gate.CommitAsync(ct);
+
+            using var change = await changePending;
+            using var create = await createPending;
+            var changeWon = change.StatusCode == HttpStatusCode.OK;
+            if (changeWon)
+            {
+                var details = await change.Content.ReadFromJsonAsync<EnrollmentDetailsResponse>(ct);
+                Assert.IsNotNull(details);
+                Assert.AreEqual((booking.Id, 3, 0), (details.Id, details.Seats, details.Pass.RemainingVisits));
+            }
+            else
+            {
+                Assert.AreEqual(HttpStatusCode.Created, create.StatusCode);
+            }
+
+            var loser = changeWon ? create : change;
+            Assert.AreEqual(HttpStatusCode.Conflict, loser.StatusCode);
+            var problem = await loser.Content.ReadFromJsonAsync<JsonElement>(ct);
+            Assert.AreEqual(rejectionReason, problem.GetProperty("reason").GetString());
+
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: changeWon ? 3 : 2,
+                visits: sameClass && !changeWon ? 1 : 0);
+            if (sameClass)
+            {
+                var creatorVisits = await db.Set<Pass>().Where(pass => pass.UserId == creatorId)
+                    .Select(pass => pass.RemainingVisits).SingleAsync(ct);
+                Assert.AreEqual(changeWon ? 1 : 0, creatorVisits);
+            }
+
+            var created = await db.Set<Enrollment>().Where(entry => entry.ClassId == createClassId &&
+                entry.Id != booking.Id).ToListAsync(ct);
+            Assert.HasCount(changeWon ? 0 : 1, created);
+            Assert.AreEqual(changeWon ? 0 : 1,
+                await db.Set<IdempotencyEntry>().CountAsync(entry => entry.OriginalKey == key, ct));
+            if (!changeWon)
+            {
+                var persisted = created.Single();
+                Assert.AreEqual((creatorId, 1, "active"), (persisted.UserId, persisted.Seats, persisted.Status));
+            }
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+        }
+    }
+
+    [TestMethod]
+    [DataRow(false, 2)]
+    [DataRow(false, 3)]
+    [DataRow(true, 3)]
+    [DataRow(true, 1)]
+    public async Task SeatChangeRejectsClassThatStartsWhileWaitingForLock(bool waitForPass, int seats)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 3);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        if (waitForPass)
+            Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
+        else
+            Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+
+        var pending = client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats }, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 1, ct);
+            clock.SetUtcNow(now.AddDays(1));
+            await gate.CommitAsync(ct);
+
+            using var response = await pending;
+            Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+            Assert.AreEqual("class-started", problem.GetProperty("reason").GetString());
+            await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 1);
+        }
+        finally
+        {
+            await timeout.CancelAsync();
+        }
+    }
+
     private static async Task WaitForBlockedRequestsAsync(DbContext db, int expected, CancellationToken ct)
     {
         while (await db.Database.SqlQueryRaw<int>(
