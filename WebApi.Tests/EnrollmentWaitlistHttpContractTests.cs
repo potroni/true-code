@@ -229,13 +229,15 @@ public partial class EnrollmentHttpContractTests
             WaitlistResult = new JoinWaitlistResult.ClassNotFound()
         });
         using var client = CreateAuthenticatedClient(factory);
-        for (var index = 0; index < 30; index++)
+        for (var index = 0; index < 20; index++)
         {
             using var details = await client.GetAsync("/enrollments/1");
             Assert.AreEqual(HttpStatusCode.NotFound, details.StatusCode);
             using var request = CreateRequest(ValidBody, "key", WaitlistPath);
             using var response = await client.SendAsync(request);
             Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
+            using var cancellation = await client.PostAsync($"{WaitlistPath}/1/cancel", null);
+            Assert.AreEqual(HttpStatusCode.NotFound, cancellation.StatusCode);
         }
 
         using var rejectedRequest = cancel
@@ -294,6 +296,16 @@ public partial class EnrollmentHttpContractTests
             {
                 ClassId = classId, UserId = users[0], Seats = 1, CreatedAt = storedTime.AddMinutes(-1),
                 Status = WaitlistStatus.Cancelled
+            },
+            new WaitlistEntry
+            {
+                ClassId = classId, UserId = users[0], Seats = 1, CreatedAt = storedTime.AddMinutes(-2),
+                Status = WaitlistStatus.Promoted
+            },
+            new WaitlistEntry
+            {
+                ClassId = classId, UserId = users[0], Seats = 1, CreatedAt = storedTime.AddMinutes(-3),
+                Status = WaitlistStatus.Closed
             });
         await db.SaveChangesAsync();
         var visits = await db.Set<Pass>().Where(pass => pass.UserId == users[0])
@@ -322,12 +334,30 @@ public partial class EnrollmentHttpContractTests
         var problem = await duplicateResponse.Content.ReadFromJsonAsync<JsonElement>();
         Assert.AreEqual("already-waiting", problem.GetProperty("reason").GetString());
 
-        first.Status = WaitlistStatus.Cancelled;
-        await db.SaveChangesAsync();
+        using var firstClient = CreateAuthenticatedClient(factory, users[1]);
+        using var cancelFirst = await firstClient.PostAsync($"{WaitlistPath}/{first.Id}/cancel", null);
+        Assert.AreEqual(HttpStatusCode.OK, cancelFirst.StatusCode);
         using var replay = CreateRequest(requestBody, key, WaitlistPath);
         using var replayResponse = await client.SendAsync(replay);
         Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
         Assert.AreEqual(body, await replayResponse.Content.ReadAsStringAsync());
+
+        using var rejoin = CreateRequest(requestBody, Guid.NewGuid().ToString("N"), WaitlistPath);
+        using var rejoinResponse = await firstClient.SendAsync(rejoin);
+        Assert.AreEqual(HttpStatusCode.Created, rejoinResponse.StatusCode);
+        var rejoined = await rejoinResponse.Content.ReadFromJsonAsync<JoinWaitlistResponse>();
+        Assert.IsNotNull(rejoined);
+        Assert.AreNotEqual(first.Id, rejoined.Id);
+        Assert.AreEqual(2, rejoined.Position);
+
+        using var cancellation = await client.PostAsync($"{WaitlistPath}/{result.Id}/cancel", null);
+        Assert.AreEqual(HttpStatusCode.OK, cancellation.StatusCode);
+        using var replayAfterCancellation = CreateRequest(requestBody, key, WaitlistPath);
+        using var responseAfterCancellation = await client.SendAsync(replayAfterCancellation);
+        Assert.AreEqual(HttpStatusCode.Created, responseAfterCancellation.StatusCode);
+        Assert.AreEqual(body, await responseAfterCancellation.Content.ReadAsStringAsync());
+        Assert.AreEqual(WaitlistStatus.Cancelled, await db.Set<WaitlistEntry>().Where(row => row.Id == result.Id)
+            .Select(row => row.Status).SingleAsync());
     }
 
     [TestMethod]
@@ -335,13 +365,14 @@ public partial class EnrollmentHttpContractTests
     [DataRow("cancelled", 3, HttpStatusCode.Conflict, "class-cancelled")]
     [DataRow("started", 3, HttpStatusCode.Conflict, "class-started")]
     [DataRow("upcoming", 3, HttpStatusCode.Conflict, "seats-exceed-capacity")]
-    [DataRow("upcoming", 2, HttpStatusCode.Conflict, "seats-available")]
+    [DataRow("upcoming", 1, HttpStatusCode.Conflict, "seats-available")]
     public async Task JoinWaitlistRejectsUnavailableRequests(string state, int seats, HttpStatusCode status, string? reason)
     {
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
         await using var factory = new FixedTimeApplicationFactory(now);
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
         var classId = long.MaxValue;
         if (state != "missing")
         {
@@ -350,9 +381,13 @@ public partial class EnrollmentHttpContractTests
             if (state == "started")
                 activity.StartsAt = now.UtcDateTime;
             activity.IsCancelled = state == "cancelled";
+            db.Add(new Enrollment
+            {
+                ClassId = classId, UserId = userId,
+                Seats = 1, CreatedAt = now.UtcDateTime, Status = "active"
+            });
             await db.SaveChangesAsync();
         }
-        var userId = await db.Set<User>().Select(user => user.Id).FirstAsync();
         var key = Guid.NewGuid().ToString("N");
         using var client = CreateAuthenticatedClient(factory, userId);
         using var request = CreateRequest($$"""{"classId":{{classId}},"seats":{{seats}}}""", key, WaitlistPath);
@@ -369,17 +404,24 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
-    public async Task JoinWaitlistReplaysStoredPositionAndScopesTheKeyByUserAndOperation()
+    public async Task JoinWaitlistReplaysAfterPromotionAndScopesTheKeyByUserAndOperation()
     {
         await using var factory = new ApiApplicationFactory();
         await using var scope = factory.Services.CreateAsyncScope();
         var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
         var db = unitOfWork.DbContext;
         var users = await db.Set<User>().OrderBy(user => user.Id).Select(user => user.Id).Take(2).ToArrayAsync();
-        var classId = await db.Set<Class>().Select(activity => activity.Id).FirstAsync();
+        var createdAt = new DateTime(2026, 11, 15, 8, 0, 0, DateTimeKind.Utc);
+        var classId = await AddBookingClassAsync(db, createdAt, capacity: 3);
         var key = Guid.NewGuid().ToString("N");
+        var promoted = new WaitlistEntry
+        {
+            ClassId = classId, UserId = users[0], Seats = 2, CreatedAt = createdAt, Status = WaitlistStatus.Promoted
+        };
+        db.Add(promoted);
+        await db.SaveChangesAsync();
         var storedBody =
-            $$"""{"id":123, "classId":{{classId}}, "seats":2, "position":7, "createdAt":"2026-11-15T08:00:00Z"}""";
+            $$"""{"id":{{promoted.Id}}, "classId":{{classId}}, "seats":2, "position":7, "createdAt":"2026-11-15T08:00:00Z"}""";
 
         await using (var transaction = await db.Database.BeginTransactionAsync())
         {
@@ -399,6 +441,14 @@ public partial class EnrollmentHttpContractTests
         Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
         Assert.AreEqual("application/json", replayResponse.Content.Headers.ContentType?.MediaType);
         Assert.AreEqual(storedBody, await replayResponse.Content.ReadAsStringAsync());
+        Assert.AreEqual(WaitlistStatus.Promoted, await db.Set<WaitlistEntry>().Where(row => row.Id == promoted.Id)
+            .Select(row => row.Status).SingleAsync());
+
+        using var otherClient = CreateAuthenticatedClient(factory, users[1]);
+        using var otherReplay = CreateRequest($$"""{"classId":{{classId}},"seats":3}""", key, WaitlistPath);
+        using var otherReplayResponse = await otherClient.SendAsync(otherReplay);
+        Assert.AreEqual(HttpStatusCode.Created, otherReplayResponse.StatusCode);
+        Assert.AreEqual("{}", await otherReplayResponse.Content.ReadAsStringAsync());
 
         foreach (var body in new[]
         {
