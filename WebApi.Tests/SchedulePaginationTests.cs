@@ -110,6 +110,36 @@ public class SchedulePaginationTests
     }
 
     [TestMethod]
+    public async Task ScheduleUsesExactBoundsBetweenStoredMicroseconds()
+    {
+        using var factory = new ApiApplicationFactory();
+        using var client = factory.CreateClient();
+        var options = new DbContextOptionsBuilder<ClubDbContext>()
+            .UseNpgsql(TestDatabase.PostgresConnectionString)
+            .Options;
+        await using var db = new ClubDbContext(options);
+        var room = new Room { Name = "Schedule submicrosecond bounds studio" };
+        var startsAt = Start.Date.AddHours(10);
+        var nextMicrosecond = startsAt.AddMicroseconds(1);
+        var first = Item(startsAt);
+        var second = Item(nextMicrosecond);
+        db.AddRange(first, second);
+        await db.SaveChangesAsync();
+
+        var repository = new UnitOfWork(db).Class;
+        var fractionalBound = startsAt.AddTicks(1);
+        var beforeBound = await repository.GetScheduleRowsAsync(startsAt, fractionalBound, room.Id, 42, null, 20);
+        Assert.AreEqual(first.Id, beforeBound.Single().ClassId);
+
+        var afterBound = await repository.GetScheduleRowsAsync(
+            fractionalBound, nextMicrosecond.AddTicks(1), room.Id, 42, null, 20);
+        Assert.AreEqual(second.Id, afterBound.Single().ClassId);
+
+        Class Item(DateTime start) =>
+            new() { Room = room, Title = "Yoga", StartsAt = start, DurationMinutes = 60, Capacity = 10 };
+    }
+
+    [TestMethod]
     public async Task PagesUseStrictPairOrderAndTokenFromLastReturnedItem()
     {
         using var factory = new ApiApplicationFactory();

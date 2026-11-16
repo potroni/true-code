@@ -15,7 +15,7 @@ public sealed class ScheduleQuery : IValidatableObject
     [ModelBinder(Name = "to", BinderType = typeof(ContractDateModelBinder))]
     public DateTime To { get; init; }
 
-    [FromQuery(Name = "roomId")]
+    [ModelBinder(Name = "roomId", BinderType = typeof(OptionalLongQueryModelBinder))]
     public long? RoomId { get; init; }
 
     [FromQuery(Name = "limit")]

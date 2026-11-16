@@ -40,7 +40,18 @@ public class ClassRepository : GenericRepository<Class>, IClassRepository
     public Task<List<ScheduleRow>> GetScheduleRowsAsync(DateTime from, DateTime to, long? roomId, long userId,
         (DateTime StartsAt, long ClassId)? after, int take, CancellationToken ct = default)
     {
-        var classes = _dbSet.Where(x => x.StartsAt >= from && x.StartsAt < to);
+        var fromRemainder = from.Ticks % TimeSpan.TicksPerMicrosecond;
+        var toRemainder = to.Ticks % TimeSpan.TicksPerMicrosecond;
+        var fromMicrosecond = from.AddTicks(-fromRemainder);
+        var toMicrosecond = to.AddTicks(-toRemainder);
+
+        // решение: сравниваем с целыми микросекундами и меняем знак сравнения для дробных границ.
+        var classes = fromRemainder == 0
+            ? _dbSet.Where(x => x.StartsAt >= fromMicrosecond)
+            : _dbSet.Where(x => x.StartsAt > fromMicrosecond);
+        classes = toRemainder == 0
+            ? classes.Where(x => x.StartsAt < toMicrosecond)
+            : classes.Where(x => x.StartsAt <= toMicrosecond);
 
         if (roomId is long room)
             classes = classes.Where(x => x.RoomId == room);

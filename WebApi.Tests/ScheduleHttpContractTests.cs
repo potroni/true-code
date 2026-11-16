@@ -42,6 +42,8 @@ public class ScheduleHttpContractTests
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T12:00%2B02:00")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T09:59")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&roomId=no")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&roomId=")]
+    [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&roomId=%20")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=no")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=0")]
     [DataRow("?from=2026-09-22T10:00&to=2026-09-22T13:00&limit=101")]
