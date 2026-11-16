@@ -15,6 +15,8 @@ public interface IEnrollmentService
 
     Task<ChangeSeatsResult> ChangeSeatsAsync(long enrollmentId, long userId, int seats, CancellationToken ct);
 
+    Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct);
+
     Task<CreateEnrollmentResult> CreateAsync(
         long userId, long classId, int seats, string idempotencyKey, CancellationToken ct);
 }
@@ -33,6 +35,9 @@ public abstract record CreateEnrollmentResult
 internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider timeProvider) : IEnrollmentService
 {
     private const IdempotencyOperation Operation = IdempotencyOperation.CreateEnrollment;
+
+    public Task<CancelEnrollmentResult> CancelAsync(long enrollmentId, long userId, CancellationToken ct) =>
+        Task.FromResult<CancelEnrollmentResult>(new CancelEnrollmentResult.NotImplemented());
 
     public async Task<EnrollmentDetailsResponse?> GetDetailsAsync(
         long enrollmentId, long userId, CancellationToken ct)
@@ -249,4 +254,17 @@ public abstract record ChangeSeatsResult
     public sealed record NotFound : ChangeSeatsResult;
 
     public sealed record Conflict(string Reason) : ChangeSeatsResult;
+}
+
+public abstract record CancelEnrollmentResult
+{
+    private CancelEnrollmentResult() { }
+
+    public sealed record Success(CancelEnrollmentResponse Response) : CancelEnrollmentResult;
+
+    public sealed record NotFound : CancelEnrollmentResult;
+
+    public sealed record Conflict(string Reason) : CancelEnrollmentResult;
+
+    public sealed record NotImplemented : CancelEnrollmentResult;
 }
