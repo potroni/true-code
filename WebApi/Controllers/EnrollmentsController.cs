@@ -13,6 +13,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<EnrollmentResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(StatusCodes.Status501NotImplemented)]
@@ -32,7 +33,8 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
                 ContentType = "application/json; charset=utf-8",
                 StatusCode = StatusCodes.Status201Created
             },
-            CreateEnrollmentResult.KeyConflict => ConflictWithReason("idempotency-key-conflict"),
+            CreateEnrollmentResult.ClassNotFound => Problem(statusCode: StatusCodes.Status404NotFound),
+            CreateEnrollmentResult.Conflict conflict => ConflictWithReason(conflict.Reason),
             CreateEnrollmentResult.NotImplemented => Problem(statusCode: StatusCodes.Status501NotImplemented),
             _ => throw new InvalidOperationException("Unexpected enrollment result.")
         };
