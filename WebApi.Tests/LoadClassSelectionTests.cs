@@ -64,12 +64,10 @@ public class LoadClassSelectionTests
             """);
 
         var repository = new ClassRepository(db.Classes, db.Database);
-        Assert.AreEqual(atFirst.Id,
-            await repository.QueryClassesForLoad(DateOnly.MinValue, DateOnly.MinValue, room.Id)
-                .Select(x => x.Id).SingleAsync());
-        Assert.AreEqual(atLast.Id,
-            await repository.QueryClassesForLoad(DateOnly.MaxValue, DateOnly.MaxValue, room.Id)
-                .Select(x => x.Id).SingleAsync());
+        CollectionAssert.AreEqual(new[] { new LoadRow(DateOnly.MinValue, room.Id, room.Name, 1, 10, 0) },
+            await repository.GetLoadRowsAsync(DateOnly.MinValue, DateOnly.MinValue, room.Id));
+        CollectionAssert.AreEqual(new[] { new LoadRow(DateOnly.MaxValue, room.Id, room.Name, 1, 10, 0) },
+            await repository.GetLoadRowsAsync(DateOnly.MaxValue, DateOnly.MaxValue, room.Id));
     }
 
     [TestMethod]

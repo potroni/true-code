@@ -37,6 +37,8 @@ public class AnalyticsHttpContractTests
     [TestMethod]
     [DataRow("?to=2026-09-22")]
     [DataRow("?from=2026-09-22")]
+    [DataRow("?query.from=2026-09-22&query.to=2026-09-22")]
+    [DataRow("?from=2026-09-22&query.to=2026-09-22")]
     [DataRow("?from=2026-9-22&to=2026-09-22")]
     [DataRow("?from=2026-09-22&to=2026-09-22T00:00:00Z")]
     [DataRow("?from=2026-09-23&to=2026-09-22")]
@@ -81,7 +83,8 @@ public class AnalyticsHttpContractTests
         }
 
         var url = $"{Path}?from={date}&to={date}";
-        var item = (await GetItemsAsync(client, url)).EnumerateArray().Single();
+        var item = (await GetItemsAsync(client, $"{url}&query.from=invalid&query.to=invalid&query.roomId=invalid"))
+            .EnumerateArray().Single();
         AssertProperties(item, "date", "room", "classesCount", "totalCapacity", "bookedSeats");
         Assert.AreEqual(date, item.GetProperty("date").GetString());
         var roomJson = item.GetProperty("room");
