@@ -58,14 +58,10 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             return new CancelEnrollmentResult.Success(
                 new CancelEnrollmentResponse(enrollment.Id, enrollment.RefundedVisits!.Value));
 
-        // решение: для отмененного клубом занятия очередь не продвигаем и блокируем только абонемент владельца.
-        var waiting = activity.IsCancelled ? [] : await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct);
-        var passUserIds = waiting.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
+        var (candidates, availableSeats) = await GetPromotionCandidatesAsync(activity, enrollment.Seats, ct);
+        var passUserIds = candidates.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
         var passes = await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
 
-        var availableSeats = waiting.Count == 0
-            ? 0
-            : activity.Capacity - await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct) + enrollment.Seats;
         var cancelledAt = timeProvider.GetUtcNow().UtcDateTime;
         if (!activity.IsCancelled && activity.StartsAt <= cancelledAt)
             return new CancelEnrollmentResult.Conflict("class-started");
@@ -89,8 +85,11 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             enrollment.CancelledAt = cancelledAt;
             enrollment.RefundedVisits = refundedVisits;
             pass.RemainingVisits = (int)remainingVisits;
-            await PromoteWaitlistAsync(waiting, passesByUser, availableSeats, cancelledAt, trackedEntries, ct);
+            await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, cancelledAt, trackedEntries, ct);
             await unitOfWork.SaveChangesAsync(ct);
+            if (!activity.IsCancelled && HasStarted(activity))
+                return new CancelEnrollmentResult.Conflict("class-started");
+
             await transaction.CommitAsync(ct);
         }
         finally
@@ -100,6 +99,24 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         }
 
         return new CancelEnrollmentResult.Success(new CancelEnrollmentResponse(enrollment.Id, refundedVisits));
+    }
+
+    private async Task<(WaitlistEntry[] Candidates, long AvailableSeats)> GetPromotionCandidatesAsync(
+        Class activity, int releasedSeats, CancellationToken ct)
+    {
+        // решение: для отмененного клубом занятия очередь не продвигаем и блокируем только абонемент владельца.
+        if (activity.IsCancelled || releasedSeats <= 0)
+            return ([], 0);
+
+        var waiting = await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct);
+        if (waiting.Count == 0)
+            return ([], 0);
+
+        var availableSeats = activity.Capacity
+            - await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct) + releasedSeats;
+        // решение: до проверки абонементов не вычитаем места предыдущих заявок, поскольку они могут закрыться.
+        var candidates = waiting.TakeWhile(request => request.Seats <= availableSeats).ToArray();
+        return (candidates, availableSeats);
     }
 
     private async Task PromoteWaitlistAsync(
@@ -196,8 +213,8 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         var seatDelta = seats - enrollment.Seats;
         if (seatDelta != 0)
         {
-            var waiting = seatDelta < 0 ? await unitOfWork.Waitlist.GetWaitingAsync(activity.Id, ct) : [];
-            var passUserIds = waiting.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
+            var (candidates, availableSeats) = await GetPromotionCandidatesAsync(activity, -seatDelta, ct);
+            var passUserIds = candidates.Select(x => x.UserId).Prepend(userId).Distinct().ToArray();
             var passes = await unitOfWork.Pass.LockByUsersAsync(passUserIds, ct);
             var passesByUser = passes.ToDictionary(x => x.UserId);
             var pass = passesByUser[userId];
@@ -216,9 +233,6 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             if (remainingVisits > int.MaxValue)
                 return new ChangeSeatsResult.Conflict("pass-balance-overflow");
 
-            var availableSeats = waiting.Count == 0
-                ? 0
-                : activity.Capacity - await unitOfWork.Enrollment.SumActiveSeatsAsync(activity.Id, ct) - seatDelta;
             var changedAt = timeProvider.GetUtcNow().UtcDateTime;
             if (activity.StartsAt <= changedAt)
                 return new ChangeSeatsResult.Conflict("class-started");
@@ -230,7 +244,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
                 trackedEntries.Add(unitOfWork.DbContext.Attach(pass));
                 enrollment.Seats = seats;
                 pass.RemainingVisits = (int)remainingVisits;
-                await PromoteWaitlistAsync(waiting, passesByUser, availableSeats, changedAt, trackedEntries, ct);
+                await PromoteWaitlistAsync(candidates, passesByUser, availableSeats, changedAt, trackedEntries, ct);
                 await unitOfWork.SaveChangesAsync(ct);
             }
             finally

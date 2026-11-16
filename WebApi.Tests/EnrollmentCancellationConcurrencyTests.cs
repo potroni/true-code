@@ -170,6 +170,115 @@ public partial class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    public async Task CancellationRollsBackIfClassStartsWhileWritingChanges()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
+        var candidate = await AddBookingClientAsync(db, now.UtcDateTime, visits: 2);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 2);
+        var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
+        var waiting = await AddWaitingAsync(db, candidate, classId, now.UtcDateTime, seats: 2);
+        using var client = CreateAuthenticatedClient(factory, owner);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        await db.Database.ExecuteSqlRawAsync("LOCK TABLE enrollments IN SHARE MODE", ct);
+        var pending = client.PostAsync($"/enrollments/{booking.Id}/cancel", null, ct);
+        await WaitForBlockedRequestsAsync(db, 1, ct);
+        clock.SetUtcNow(now.AddDays(1));
+        await gate.CommitAsync(ct);
+
+        using var response = await pending;
+        Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+        Assert.AreEqual("class-started", problem.GetProperty("reason").GetString());
+        await db.Entry(booking).ReloadAsync(ct);
+        Assert.AreEqual("active", booking.Status);
+        Assert.IsNull(booking.RefundedVisits);
+        Assert.IsNull(booking.CancelledAt);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 0);
+        await AssertPromotionAsync(db, waiting, WaitlistStatus.Waiting, visits: 2);
+    }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task ReleasingSeatsDoesNotWaitForPassesBeyondPromotionCandidates(bool cancel)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
+        var candidate = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var oversizedUser = await AddBookingClientAsync(db, now.UtcDateTime, visits: 3);
+        var tailUser = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: cancel ? 2 : 3);
+        var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
+        var first = await AddWaitingAsync(db, candidate, classId, now.UtcDateTime, seats: 1);
+        var oversized = await AddWaitingAsync(db, oversizedUser, classId, now.UtcDateTime, seats: 3);
+        var tail = await AddWaitingAsync(db, tailUser, classId, now.UtcDateTime, seats: 1);
+        using var client = CreateAuthenticatedClient(factory, owner);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.HasCount(2, await unitOfWork.Pass.LockByUsersAsync([oversizedUser, tailUser], ct));
+        using var response = cancel
+            ? await client.PostAsync($"/enrollments/{booking.Id}/cancel", null, ct)
+            : await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 1 }, ct);
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        await gate.CommitAsync(ct);
+
+        await db.Entry(booking).ReloadAsync(ct);
+        Assert.AreEqual(cancel ? "cancelled" : "active", booking.Status);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: cancel ? 2 : 1, visits: cancel ? 2 : 1);
+        await AssertPromotionAsync(db, first, WaitlistStatus.Promoted, visits: 0);
+        await AssertPromotionAsync(db, oversized, WaitlistStatus.Waiting, visits: 3);
+        await AssertPromotionAsync(db, tail, WaitlistStatus.Waiting, visits: 1);
+    }
+
+    [TestMethod]
+    public async Task CancellationUsesRequestTimeForRefundWhenPassLockWaitCrossesTwoHourBoundary()
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var owner = await AddBookingClientAsync(db, now.UtcDateTime, visits: 0);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime.AddHours(2).AddDays(-1), capacity: 2);
+        var booking = await AddEnrollmentAsync(db, owner, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, owner);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([owner], ct));
+        var pending = client.PostAsync($"/enrollments/{booking.Id}/cancel", null, ct);
+        await WaitForBlockedRequestsAsync(db, 1, ct);
+        var cancelledAt = now.AddSeconds(1);
+        clock.SetUtcNow(cancelledAt);
+        await gate.CommitAsync(ct);
+
+        using var response = await pending;
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+        Assert.AreEqual(2, body.GetProperty("refundedVisits").GetInt32());
+        await db.Entry(booking).ReloadAsync(ct);
+        Assert.AreEqual(("cancelled", 2, cancelledAt.UtcDateTime),
+            (booking.Status, booking.RefundedVisits, booking.CancelledAt));
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 2);
+    }
+
+    [TestMethod]
     public async Task CancellationRollsBackAllWritesWhenPromotionFails()
     {
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
