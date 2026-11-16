@@ -413,6 +413,92 @@ public class EnrollmentHttpContractTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task CreateRejectsClassThatStartsWhileWaitingForLock(bool blockPass)
+    {
+        var now = new DateTimeOffset(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(now);
+        await using var factory = new FixedTimeApplicationFactory(clock);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var unitOfWork = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        var db = unitOfWork.DbContext;
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits: 1);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 1);
+        var key = Guid.NewGuid().ToString("N");
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var request = CreateRequest($$"""{"classId":{{classId}},"seats":1}""", key);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = timeout.Token;
+
+        await using var gate = await db.Database.BeginTransactionAsync(ct);
+        if (blockPass)
+            Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
+        else
+            Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+
+        var pendingResponse = client.SendAsync(request, ct);
+        try
+        {
+            await WaitForBlockedRequestsAsync(db, 1, ct);
+            clock.SetUtcNow(now.AddDays(1));
+            await gate.CommitAsync(ct);
+
+            using var response = await pendingResponse;
+            Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+            var problem = await response.Content.ReadFromJsonAsync<JsonElement>(ct);
+            Assert.AreEqual("class-started", problem.GetProperty("reason").GetString());
+            Assert.IsFalse(await db.Set<Enrollment>().AnyAsync(entry => entry.ClassId == classId, ct));
+            Assert.IsFalse(await db.Set<IdempotencyEntry>().AnyAsync(entry => entry.OriginalKey == key, ct));
+            Assert.AreEqual(1, await db.Set<Pass>().Where(pass => pass.UserId == userId)
+                .Select(pass => pass.RemainingVisits).SingleAsync(ct));
+        }
+        finally
+        {
+            if (!pendingResponse.IsCompleted)
+                await timeout.CancelAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task CreateAllowsDifferentUsersToReuseTheSameKey()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var now = DateTime.UtcNow;
+        var firstUser = await AddBookingClientAsync(db, now, visits: 1);
+        var secondUser = await AddBookingClientAsync(db, now, visits: 1);
+        var classId = await AddBookingClassAsync(db, now, capacity: 2);
+        var key = Guid.NewGuid().ToString("N");
+        var body = $$"""{"classId":{{classId}},"seats":1}""";
+
+        foreach (var userId in new[] { firstUser, secondUser })
+        {
+            using var client = CreateAuthenticatedClient(factory, userId);
+            using var request = CreateRequest(body, key);
+            using var response = await client.SendAsync(request);
+            Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
+            var responseBody = await response.Content.ReadAsStringAsync();
+            var booking = JsonSerializer.Deserialize<EnrollmentResponse>(responseBody, JsonSerializerOptions.Web);
+            Assert.IsNotNull(booking);
+            var enrolledUser = await db.Set<Enrollment>().Where(entry => entry.Id == booking.Id)
+                .Select(entry => entry.UserId).SingleAsync();
+            Assert.AreEqual(userId, enrolledUser);
+            Assert.AreEqual(0, await db.Set<Pass>().Where(pass => pass.UserId == userId)
+                .Select(pass => pass.RemainingVisits).SingleAsync());
+
+            using var replay = CreateRequest(body, key);
+            using var replayResponse = await client.SendAsync(replay);
+            Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
+            Assert.AreEqual(responseBody, await replayResponse.Content.ReadAsStringAsync());
+        }
+
+        Assert.AreEqual(2, await db.Set<Enrollment>().CountAsync(entry => entry.ClassId == classId));
+        Assert.AreEqual(2, await db.Set<IdempotencyEntry>().CountAsync(entry => entry.OriginalKey == key));
+    }
+
+    [TestMethod]
     [DataRow(true, false, false, null)]
     [DataRow(true, true, false, "idempotency-key-conflict")]
     [DataRow(false, false, true, "capacity-exceeded")]
@@ -590,19 +676,25 @@ public class EnrollmentHttpContractTests
         }
     }
 
-    private sealed class FixedTimeApplicationFactory(DateTimeOffset now) : ApiApplicationFactory
+    private sealed class FixedTimeApplicationFactory(TimeProvider clock) : ApiApplicationFactory
     {
+        public FixedTimeApplicationFactory(DateTimeOffset now) : this(new AdjustableTimeProvider(now)) { }
+
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
             builder.ConfigureTestServices(services =>
-                services.Replace(ServiceDescriptor.Singleton<TimeProvider>(new FixedTimeProvider(now))));
+                services.Replace(ServiceDescriptor.Singleton(clock)));
         }
     }
 
-    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    private sealed class AdjustableTimeProvider(DateTimeOffset now) : TimeProvider
     {
-        public override DateTimeOffset GetUtcNow() => now;
+        private long _utcTicks = now.UtcTicks;
+
+        public override DateTimeOffset GetUtcNow() => new(Interlocked.Read(ref _utcTicks), TimeSpan.Zero);
+
+        public void SetUtcNow(DateTimeOffset value) => Interlocked.Exchange(ref _utcTicks, value.UtcTicks);
     }
 
     private sealed class EnrollmentServiceStub : IEnrollmentService
