@@ -25,6 +25,8 @@ public class EnrollmentHttpContractTests
 
     [TestMethod]
     [DataRow("active", false)]
+    [DataRow("active", true)]
+    [DataRow("cancelled", false)]
     [DataRow("cancelled", true)]
     public async Task GetDetailsReturnsTheOwnedBookingWithCurrentPass(string status, bool classCancelled)
     {
@@ -38,56 +40,64 @@ public class EnrollmentHttpContractTests
         var classId = await AddBookingClassAsync(db, now, capacity: 10);
         var activity = await db.Set<Class>().Include(x => x.Room).SingleAsync(x => x.Id == classId);
         activity.IsCancelled = classCancelled;
-        var enrollment = new Enrollment
-        {
-            UserId = userId,
-            ClassId = classId,
-            Seats = 2,
-            Status = status,
-            CreatedAt = now,
-            CancelledAt = status == "cancelled" ? now.AddHours(1) : null,
-            RefundedVisits = status == "cancelled" ? 2 : null
-        };
-        db.Add(enrollment);
-        await db.SaveChangesAsync();
+        var enrollment = await AddEnrollmentAsync(db, userId, classId, now, status);
 
         using var client = CreateAuthenticatedClient(factory, userId);
         using var response = await client.GetAsync($"/enrollments/{enrollment.Id}?userId={otherUserId}");
         Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        AssertBookingCard(body, enrollment, activity, seats: 2, visits: 5, validUntil: validUntil);
+
+        using var otherClient = CreateAuthenticatedClient(factory, otherUserId);
+        using var foreign = await otherClient.GetAsync($"/enrollments/{enrollment.Id}?userId={userId}");
+        using var missing = await otherClient.GetAsync($"/enrollments/{long.MaxValue}");
+        await AssertBookingNotFoundAsync(foreign);
+        await AssertBookingNotFoundAsync(missing);
+    }
+
+    private static void AssertBookingCard(
+        JsonElement body, Enrollment enrollment, Class activity, int seats, int visits, DateOnly validUntil)
+    {
+        AssertProperties(body, "id", "status", "seats", "createdAt", "class", "pass");
         Assert.AreEqual(enrollment.Id, body.GetProperty("id").GetInt64());
-        Assert.AreEqual(status, body.GetProperty("status").GetString());
-        Assert.AreEqual(2, body.GetProperty("seats").GetInt32());
+        Assert.AreEqual(enrollment.Status, body.GetProperty("status").GetString());
+        Assert.AreEqual(seats, body.GetProperty("seats").GetInt32());
         var createdAt = body.GetProperty("createdAt").GetDateTimeOffset();
-        Assert.AreEqual(new DateTimeOffset(now), createdAt);
+        Assert.AreEqual(new DateTimeOffset(enrollment.CreatedAt), createdAt);
         Assert.AreEqual(TimeSpan.Zero, createdAt.Offset);
         var classBody = body.GetProperty("class");
-        Assert.AreEqual(classId, classBody.GetProperty("id").GetInt64());
+        AssertProperties(classBody, "id", "title", "startsAt", "durationMinutes", "isCancelled", "room");
+        Assert.AreEqual(activity.Id, classBody.GetProperty("id").GetInt64());
         Assert.AreEqual(activity.Title, classBody.GetProperty("title").GetString());
         var startsAt = classBody.GetProperty("startsAt").GetDateTimeOffset();
         Assert.AreEqual(new DateTimeOffset(activity.StartsAt), startsAt);
         Assert.AreEqual(TimeSpan.Zero, startsAt.Offset);
         Assert.AreEqual(activity.DurationMinutes, classBody.GetProperty("durationMinutes").GetInt32());
-        Assert.AreEqual(classCancelled, classBody.GetProperty("isCancelled").GetBoolean());
+        Assert.AreEqual(activity.IsCancelled, classBody.GetProperty("isCancelled").GetBoolean());
         var room = classBody.GetProperty("room");
+        AssertProperties(room, "id", "name");
         Assert.AreEqual(activity.Room.Id, room.GetProperty("id").GetInt64());
         Assert.AreEqual(activity.Room.Name, room.GetProperty("name").GetString());
         var pass = body.GetProperty("pass");
-        Assert.AreEqual(5, pass.GetProperty("remainingVisits").GetInt32());
-        Assert.AreEqual("2026-11-17", pass.GetProperty("validUntil").GetString());
+        AssertProperties(pass, "remainingVisits", "validUntil");
+        Assert.AreEqual(visits, pass.GetProperty("remainingVisits").GetInt32());
+        Assert.AreEqual(validUntil.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+            pass.GetProperty("validUntil").GetString());
+    }
 
-        using var otherClient = CreateAuthenticatedClient(factory, otherUserId);
-        using var foreign = await otherClient.GetAsync($"/enrollments/{enrollment.Id}?userId={userId}");
-        using var missing = await otherClient.GetAsync($"/enrollments/{long.MaxValue}");
-        foreach (var notFound in new[] { foreign, missing })
-        {
-            Assert.AreEqual(HttpStatusCode.NotFound, notFound.StatusCode);
-            Assert.AreEqual("application/problem+json", notFound.Content.Headers.ContentType?.MediaType);
-            var problem = await notFound.Content.ReadFromJsonAsync<ProblemDetails>();
-            Assert.IsNotNull(problem);
-            Assert.AreEqual(404, problem.Status);
-            Assert.IsNull(problem.Detail);
-        }
+    private static void AssertProperties(JsonElement value, params string[] names)
+    {
+        CollectionAssert.AreEquivalent(names, value.EnumerateObject().Select(property => property.Name).ToArray());
+    }
+
+    private static async Task AssertBookingNotFoundAsync(HttpResponseMessage response)
+    {
+        Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.IsNotNull(problem);
+        Assert.AreEqual(404, problem.Status);
+        Assert.IsNull(problem.Detail);
     }
 
     [TestMethod]
@@ -155,11 +165,15 @@ public class EnrollmentHttpContractTests
 
     [TestMethod]
     [DataRow("0", """{"seats":2}""")]
+    [DataRow("-1", """{"seats":2}""")]
     [DataRow("invalid", """{"seats":2}""")]
+    [DataRow("9223372036854775808", """{"seats":2}""")]
     [DataRow("42", null)]
     [DataRow("42", "null")]
     [DataRow("42", "{}")]
     [DataRow("42", """{"seats":0}""")]
+    [DataRow("42", """{"seats":-1}""")]
+    [DataRow("42", """{"seats":null}""")]
     [DataRow("42", """{"seats":"2"}""")]
     [DataRow("42", """{"seats":1.5}""")]
     [DataRow("42", """{"seats":2147483648}""")]
@@ -229,6 +243,85 @@ public class EnrollmentHttpContractTests
         var schema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/EnrollmentDetailsResponse", schema.GetProperty("$ref").GetString());
+    }
+
+    [TestMethod]
+    public async Task ChangeSeatsReturnsNotFoundForForeignAndMissingBookings()
+    {
+        await using var factory = new ApiApplicationFactory();
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var now = new DateTime(2026, 11, 16, 8, 0, 0, DateTimeKind.Utc);
+        var ownerId = await AddBookingClientAsync(db, now, visits: 3);
+        var otherUserId = await AddBookingClientAsync(db, now, visits: 3);
+        var classId = await AddBookingClassAsync(db, now, capacity: 4);
+        var booking = await AddEnrollmentAsync(db, ownerId, classId, now);
+
+        using var client = CreateAuthenticatedClient(factory, otherUserId);
+        using var foreign = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats?userId={ownerId}",
+            new { seats = 3, userId = ownerId });
+        using var missing = await client.PostAsJsonAsync($"/enrollments/{long.MaxValue}/seats", new { seats = 3 });
+        await AssertBookingNotFoundAsync(foreign);
+        await AssertBookingNotFoundAsync(missing);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: 3);
+    }
+
+    [TestMethod]
+    [DataRow("capacity-exceeded", 2, 5, 0, 1, false, false, 3)]
+    [DataRow("pass-exhausted", 5, 1, 0, 1, false, false, 4)]
+    [DataRow("pass-expired", 5, 5, -1, 1, false, false, 3)]
+    [DataRow("class-started", 5, 5, 0, 0, false, false, 2)]
+    [DataRow("class-cancelled", 5, 5, 0, 1, true, false, 2)]
+    [DataRow("enrollment-cancelled", 5, 5, 0, 1, false, true, 2)]
+    public async Task ChangeSeatsRejectsConflictsWithoutChangingTheBookingOrPass(
+        string reason, int capacity, int visits, int validForDays, int startsInDays,
+        bool classCancelled, bool enrollmentCancelled, int requestedSeats)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var validUntil = DateOnly.FromDateTime(now.UtcDateTime).AddDays(validForDays);
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits, validUntil);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity);
+        var activity = await db.Set<Class>().SingleAsync(entry => entry.Id == classId);
+        activity.StartsAt = now.AddDays(startsInDays).UtcDateTime;
+        activity.IsCancelled = classCancelled;
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.AddDays(-1).UtcDateTime,
+            enrollmentCancelled ? "cancelled" : "active");
+
+        using var client = CreateAuthenticatedClient(factory, userId);
+        using var response = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats",
+            new { seats = requestedSeats });
+        Assert.AreEqual(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.AreEqual("application/problem+json", response.Content.Headers.ContentType?.MediaType);
+        var problem = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(409, problem.GetProperty("status").GetInt32());
+        Assert.AreEqual(reason, problem.GetProperty("reason").GetString());
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 2, visits: visits);
+    }
+
+    [TestMethod]
+    [DataRow(3, -1)]
+    [DataRow(0, 1)]
+    public async Task ChangeSeatsReturnsVisitsToAnExpiredOrExhaustedPass(int visits, int validForDays)
+    {
+        var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(now);
+        await using var scope = factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
+        var validUntil = DateOnly.FromDateTime(now.UtcDateTime).AddDays(validForDays);
+        var userId = await AddBookingClientAsync(db, now.UtcDateTime, visits, validUntil);
+        var classId = await AddBookingClassAsync(db, now.UtcDateTime, capacity: 4);
+        var activity = await db.Set<Class>().Include(entry => entry.Room).SingleAsync(entry => entry.Id == classId);
+        var booking = await AddEnrollmentAsync(db, userId, classId, now.UtcDateTime);
+        using var client = CreateAuthenticatedClient(factory, userId);
+
+        using var response = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 1 });
+        Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+        AssertBookingCard(await response.Content.ReadFromJsonAsync<JsonElement>(), booking, activity,
+            seats: 1, visits: visits + 1, validUntil: validUntil);
+        await AssertPersistedSeatsAndVisitsAsync(db, booking, seats: 1, visits: visits + 1);
     }
 
     [TestMethod]
@@ -321,10 +414,12 @@ public class EnrollmentHttpContractTests
         using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
         using var client = CreateAuthenticatedClient(factory);
 
-        for (var index = 0; index < 60; index++)
+        for (var index = 0; index < 30; index++)
         {
             using var response = await client.GetAsync("/enrollments/1");
             Assert.AreEqual(HttpStatusCode.NotFound, response.StatusCode);
+            using var change = await client.PostAsJsonAsync("/enrollments/1/seats", new { seats = 2 });
+            Assert.AreEqual(HttpStatusCode.NotFound, change.StatusCode);
         }
 
         using var request = CreateRequest(ValidBody, "key");
@@ -595,12 +690,17 @@ public class EnrollmentHttpContractTests
     [TestMethod]
     public async Task CreateReplaysOriginalResponseAfterResizeAndCancellation()
     {
-        await using var factory = new ApiApplicationFactory();
+        var requestTime = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
+        await using var factory = new FixedTimeApplicationFactory(requestTime);
         await using var scope = factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<IUnitOfWork>().DbContext;
-        var now = DateTime.UtcNow;
-        var userId = await AddBookingClientAsync(db, now, visits: 3);
-        var classId = await AddBookingClassAsync(db, now, capacity: 3);
+        var now = requestTime.UtcDateTime;
+        var validUntil = DateOnly.FromDateTime(now);
+        var userId = await AddBookingClientAsync(db, now, visits: 3, validUntil: validUntil);
+        var classId = await AddBookingClassAsync(db, now, capacity: 2);
+        var otherClassId = await AddBookingClassAsync(db, now, capacity: 3);
+        var otherBooking = await AddEnrollmentAsync(db, userId, otherClassId, now);
+        var activity = await db.Set<Class>().Include(entry => entry.Room).SingleAsync(entry => entry.Id == classId);
         var key = Guid.NewGuid().ToString("N");
         var body = $$"""{"classId":{{classId}},"seats":1}""";
         using var client = CreateAuthenticatedClient(factory, userId);
@@ -612,13 +712,31 @@ public class EnrollmentHttpContractTests
         Assert.IsNotNull(booking);
 
         var enrollment = await db.Set<Enrollment>().SingleAsync(entry => entry.Id == booking.Id);
-        var pass = await db.Set<Pass>().SingleAsync(entry => entry.UserId == userId);
-        await db.Entry(pass).ReloadAsync();
-        enrollment.Seats = 2;
-        pass.RemainingVisits -= 1;
-        await db.SaveChangesAsync();
+        using var before = await client.GetAsync($"/enrollments/{otherBooking.Id}");
+        Assert.AreEqual(HttpStatusCode.OK, before.StatusCode);
+        var beforeBody = await before.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(2, beforeBody.GetProperty("pass").GetProperty("remainingVisits").GetInt32());
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            using var changed = await client.PostAsJsonAsync($"/enrollments/{booking.Id}/seats", new { seats = 2 });
+            Assert.AreEqual(HttpStatusCode.OK, changed.StatusCode);
+            AssertBookingCard(await changed.Content.ReadFromJsonAsync<JsonElement>(),
+                enrollment, activity, seats: 2, visits: 1, validUntil: validUntil);
+            await AssertPersistedSeatsAndVisitsAsync(db, enrollment, seats: 2, visits: 1);
+        }
+
+        using var after = await client.GetAsync($"/enrollments/{otherBooking.Id}");
+        Assert.AreEqual(HttpStatusCode.OK, after.StatusCode);
+        var afterBody = await after.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.AreEqual(otherBooking.Id, afterBody.GetProperty("id").GetInt64());
+        Assert.AreEqual(2, afterBody.GetProperty("seats").GetInt32());
+        Assert.AreEqual(1, afterBody.GetProperty("pass").GetProperty("remainingVisits").GetInt32());
+        await db.Entry(enrollment).ReloadAsync();
         await AssertReplayAsync(expectedVisits: 1);
 
+        var pass = await db.Set<Pass>().SingleAsync(entry => entry.UserId == userId);
+        await db.Entry(pass).ReloadAsync();
         enrollment.Status = "cancelled";
         enrollment.CancelledAt = now.AddMinutes(1);
         enrollment.RefundedVisits = 2;
@@ -633,9 +751,10 @@ public class EnrollmentHttpContractTests
             Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
             CollectionAssert.AreEqual(original, await response.Content.ReadAsByteArrayAsync());
 
-            var persisted = await db.Set<Enrollment>().AsNoTracking().SingleAsync(entry => entry.UserId == userId);
+            var persisted = await db.Set<Enrollment>().AsNoTracking().SingleAsync(entry => entry.Id == booking.Id);
             Assert.AreEqual((booking.Id, enrollment.Seats, enrollment.Status, enrollment.RefundedVisits),
                 (persisted.Id, persisted.Seats, persisted.Status, persisted.RefundedVisits));
+            Assert.AreEqual(2, await db.Set<Enrollment>().CountAsync(entry => entry.UserId == userId));
             Assert.AreEqual(expectedVisits, await db.Set<Pass>().Where(entry => entry.UserId == userId)
                 .Select(entry => entry.RemainingVisits).SingleAsync());
             Assert.AreEqual(1, await db.Set<IdempotencyEntry>().CountAsync(entry => entry.UserId == userId));
@@ -902,6 +1021,34 @@ public class EnrollmentHttpContractTests
         });
         await db.SaveChangesAsync();
         return user.Id;
+    }
+
+    private static async Task<Enrollment> AddEnrollmentAsync(
+        DbContext db, long userId, long classId, DateTime createdAt, string status = "active")
+    {
+        var enrollment = new Enrollment
+        {
+            UserId = userId,
+            ClassId = classId,
+            Seats = 2,
+            Status = status,
+            CreatedAt = createdAt,
+            CancelledAt = status == "cancelled" ? createdAt.AddHours(1) : null,
+            RefundedVisits = status == "cancelled" ? 2 : null
+        };
+        db.Add(enrollment);
+        await db.SaveChangesAsync();
+        return enrollment;
+    }
+
+    private static async Task AssertPersistedSeatsAndVisitsAsync(
+        DbContext db, Enrollment booking, int seats, int visits)
+    {
+        var persisted = await db.Set<Enrollment>().AsNoTracking().SingleAsync(entry => entry.Id == booking.Id);
+        Assert.AreEqual((seats, booking.Status, booking.CreatedAt, booking.CancelledAt, booking.RefundedVisits),
+            (persisted.Seats, persisted.Status, persisted.CreatedAt, persisted.CancelledAt, persisted.RefundedVisits));
+        Assert.AreEqual(visits, await db.Set<Pass>().Where(entry => entry.UserId == booking.UserId)
+            .Select(entry => entry.RemainingVisits).SingleAsync());
     }
 
     private static async Task<long> AddBookingClassAsync(DbContext db, DateTime now, int capacity)
