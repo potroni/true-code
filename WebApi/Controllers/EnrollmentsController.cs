@@ -12,10 +12,8 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [HttpPost("waitlist")]
     [ProducesResponseType<JoinWaitlistResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<JoinWaitlistResponse>> JoinWaitlist(
         [FromRequiredBody, Required] JoinWaitlistRequest request,
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
@@ -41,10 +39,8 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [HttpPost("waitlist/{id}/cancel")]
     [ProducesResponseType<CancelWaitlistResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<CancelWaitlistResponse>> CancelWaitlist([FromRoute] long id, CancellationToken ct)
     {
         var result = await enrollmentService.CancelWaitlistAsync(id, CurrentUserId, ct);
@@ -61,9 +57,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [HttpGet("{id}")]
     [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<EnrollmentDetailsResponse>> GetDetails(
         [FromRoute] long id,
         CancellationToken ct)
@@ -78,10 +72,8 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [HttpPost("{id}/seats")]
     [ProducesResponseType<EnrollmentDetailsResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<EnrollmentDetailsResponse>> ChangeSeats(
         [FromRoute] long id,
         [FromRequiredBody, Required] ChangeSeatsRequest request,
@@ -101,10 +93,8 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [HttpPost("{id}/cancel")]
     [ProducesResponseType<CancelEnrollmentResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<CancelEnrollmentResponse>> Cancel(
         [FromRoute] long id,
         CancellationToken ct)
@@ -123,10 +113,8 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [HttpPost]
     [ProducesResponseType<EnrollmentResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<EnrollmentResponse>> Create(
         [FromRequiredBody] ClassSeatsRequest request,
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,

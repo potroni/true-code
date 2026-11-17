@@ -7,6 +7,8 @@ namespace WebApi.Controllers;
 
 [Authorize]
 [BusinessRateLimit]
+[ProducesResponseType(StatusCodes.Status401Unauthorized)]
+[ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests, "application/problem+json")]
 [ProducesResponseType<ProblemDetails>(StatusCodes.Status503ServiceUnavailable)]
 public abstract class BaseApiController : ControllerBase
 {

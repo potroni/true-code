@@ -27,6 +27,21 @@ public partial class EnrollmentHttpContractTests
     private const string ValidBody = """{"classId":42,"seats":2,"userId":99}""";
 
     [TestMethod]
+    public async Task CreateDocumentsAuthenticationAndRateLimitingInOpenApi()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var responses = document.GetProperty("paths").GetProperty("/enrollments").GetProperty("post")
+            .GetProperty("responses");
+        AssertProperties(responses, "201", "400", "401", "404", "409", "429", "503");
+        var schema = responses.GetProperty("429").GetProperty("content")
+            .GetProperty("application/problem+json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/ProblemDetails", schema.GetProperty("$ref").GetString());
+    }
+
+    [TestMethod]
     [DataRow("active", false)]
     [DataRow("active", true)]
     [DataRow("cancelled", false)]
