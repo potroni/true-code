@@ -140,7 +140,7 @@ public partial class EnrollmentHttpContractTests
         Assert.AreEqual("int64", id.GetProperty("schema").GetProperty("format").GetString());
 
         var responses = operation.GetProperty("responses");
-        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "429" },
+        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "429", "503" },
             responses.EnumerateObject().Select(response => response.Name).ToArray());
         var schema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
@@ -225,7 +225,7 @@ public partial class EnrollmentHttpContractTests
         Assert.AreEqual("int64", id.GetProperty("schema").GetProperty("format").GetString());
 
         var responses = operation.GetProperty("responses");
-        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429" },
+        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429", "503" },
             responses.EnumerateObject().Select(response => response.Name).ToArray());
         var schema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
@@ -322,7 +322,7 @@ public partial class EnrollmentHttpContractTests
         Assert.IsTrue(operation.GetProperty("requestBody").GetProperty("required").GetBoolean());
 
         var responses = operation.GetProperty("responses");
-        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429" },
+        CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429", "503" },
             responses.EnumerateObject().Select(response => response.Name).ToArray());
         var schema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");

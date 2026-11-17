@@ -125,7 +125,7 @@ public partial class EnrollmentHttpContractTests
         Assert.AreEqual(1, parameters.GetArrayLength());
         Assert.AreEqual("id", parameters[0].GetProperty("name").GetString());
         Assert.AreEqual("path", parameters[0].GetProperty("in").GetString());
-        AssertProperties(operation.GetProperty("responses"), "200", "400", "401", "404", "409", "429");
+        AssertProperties(operation.GetProperty("responses"), "200", "400", "401", "404", "409", "429", "503");
         var properties = document.GetProperty("components").GetProperty("schemas")
             .GetProperty("CancelWaitlistResponse").GetProperty("properties");
         AssertProperties(properties, "id", "status");
@@ -331,7 +331,7 @@ public partial class EnrollmentHttpContractTests
         Assert.IsTrue(operation.GetProperty("requestBody").GetProperty("required").GetBoolean());
 
         var responses = operation.GetProperty("responses");
-        AssertProperties(responses, "201", "400", "401", "404", "409", "429");
+        AssertProperties(responses, "201", "400", "401", "404", "409", "429", "503");
         var schema = responses.GetProperty("201").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/JoinWaitlistResponse", schema.GetProperty("$ref").GetString());

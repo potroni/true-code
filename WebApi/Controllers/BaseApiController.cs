@@ -7,6 +7,7 @@ namespace WebApi.Controllers;
 
 [Authorize]
 [BusinessRateLimit]
+[ProducesResponseType<ProblemDetails>(StatusCodes.Status503ServiceUnavailable)]
 public abstract class BaseApiController : ControllerBase
 {
     protected const string AdminRole = ApiAuthorization.AdminRole;

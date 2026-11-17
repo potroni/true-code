@@ -37,7 +37,16 @@ builder.Services.AddScoped<IScheduleService, ScheduleService>();
 builder.Services.AddScoped<IAnalyticsService, AnalyticsService>();
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
-    ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")!));
+{
+    // решение: API запускается без Redis и возвращает 503 для бизнес-запросов до восстановления соединения.
+    var options = ConfigurationOptions.Parse(builder.Configuration.GetConnectionString("Redis")!);
+    options.AbortOnConnectFail = false;
+    options.ConnectRetry = 0;
+    options.BacklogPolicy = BacklogPolicy.FailFast;
+    options.AsyncTimeout = 1000;
+    return ConnectionMultiplexer.Connect(options);
+});
+builder.Services.AddSingleton<RedisBusinessRateLimiter>();
 
 builder.Services.AddSingleton<ICacheService>(provider =>
     new RedisCacheService(provider.GetRequiredService<IConnectionMultiplexer>(), TimeSpan.FromMinutes(5)));
@@ -96,8 +105,6 @@ app.UseAuthorization();
 
 app.MapControllers();
 app.MapHealthChecks("/health");
-
-app.Services.GetRequiredService<IConnectionMultiplexer>();
 
 using (var scope = app.Services.CreateScope())
 {

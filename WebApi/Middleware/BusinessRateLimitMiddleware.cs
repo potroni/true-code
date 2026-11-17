@@ -1,70 +1,53 @@
 using System.Globalization;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
+using StackExchange.Redis;
 using WebApi.Auth;
+using WebApi.Services;
 
 namespace WebApi.Middleware;
 
-internal sealed class BusinessRateLimitMiddleware(RequestDelegate next, TimeProvider timeProvider)
+internal sealed class BusinessRateLimitMiddleware(
+    RequestDelegate next,
+    RedisBusinessRateLimiter limiter,
+    ILogger<BusinessRateLimitMiddleware> logger)
 {
-    private const int PermitLimit = 60;
-    private static readonly TimeSpan Window = TimeSpan.FromSeconds(60);
-    private readonly object _lock = new();
-    private readonly Dictionary<long, Queue<long>> _requestsByUser = new();
-    private readonly Queue<(long UserId, long Timestamp)> _admittedRequests = new();
-
-    public Task InvokeAsync(HttpContext context)
+    public async Task InvokeAsync(HttpContext context)
     {
         if (context.GetEndpoint()?.Metadata.GetMetadata<BusinessRateLimitAttribute>() is not null &&
             context.User.Identity?.IsAuthenticated == true &&
-            ApiAuthorization.TryGetUserId(context.User, out var userId) &&
-            GetRetryAfter(userId) is { } retryAfter)
+            ApiAuthorization.TryGetUserId(context.User, out var userId))
         {
-            return WriteRejectionAsync(context, retryAfter);
-        }
-
-        return next(context);
-    }
-
-    private TimeSpan? GetRetryAfter(long userId)
-    {
-        // решение: монотонные метки допущенных запросов сохраняют точное окно, а общая очередь удаляет истекшие записи в порядке их добавления.
-        lock (_lock)
-        {
-            var now = timeProvider.GetTimestamp();
-            while (_admittedRequests.TryPeek(out var oldest) &&
-                   timeProvider.GetElapsedTime(oldest.Timestamp, now) >= Window)
+            TimeSpan retryAfter;
+            try
             {
-                _admittedRequests.Dequeue();
-                var userRequests = _requestsByUser[oldest.UserId];
-                userRequests.Dequeue();
-                if (userRequests.Count == 0)
-                    _requestsByUser.Remove(oldest.UserId);
+                retryAfter = await limiter.CheckAsync(userId, context.RequestAborted);
+            }
+            catch (Exception exception) when (exception is RedisConnectionException or RedisTimeoutException)
+            {
+                logger.LogWarning("Redis is unavailable for rate limiting ({ErrorType}).", exception.GetType().Name);
+                await WriteRejectionAsync(context, StatusCodes.Status503ServiceUnavailable);
+                return;
             }
 
-            if (!_requestsByUser.TryGetValue(userId, out var requests))
+            if (retryAfter > TimeSpan.Zero)
             {
-                requests = new Queue<long>();
-                _requestsByUser.Add(userId, requests);
+                context.Response.Headers.RetryAfter =
+                    Math.Ceiling(retryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+                await WriteRejectionAsync(context, StatusCodes.Status429TooManyRequests);
+                return;
             }
-
-            if (requests.Count >= PermitLimit)
-                return Window - timeProvider.GetElapsedTime(requests.Peek(), now);
-
-            requests.Enqueue(now);
-            _admittedRequests.Enqueue((userId, now));
-            return null;
         }
+
+        await next(context);
     }
 
-    private static Task WriteRejectionAsync(HttpContext context, TimeSpan retryAfter)
+    private static Task WriteRejectionAsync(HttpContext context, int statusCode)
     {
-        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-        context.Response.Headers.RetryAfter =
-            Math.Ceiling(retryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+        context.Response.StatusCode = statusCode;
 
-        // решение: ответ 429 всегда содержит ProblemDetails в JSON независимо от Accept.
+        // решение: отказ лимитера всегда содержит ProblemDetails в JSON независимо от Accept.
         var problem = context.RequestServices.GetRequiredService<ProblemDetailsFactory>()
-            .CreateProblemDetails(context, StatusCodes.Status429TooManyRequests);
+            .CreateProblemDetails(context, statusCode);
         return context.Response.WriteAsJsonAsync(problem, options: null,
             contentType: "application/problem+json", cancellationToken: context.RequestAborted);
     }

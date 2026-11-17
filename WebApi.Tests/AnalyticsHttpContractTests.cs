@@ -138,7 +138,7 @@ public class AnalyticsHttpContractTests
 
         Assert.AreEqual("int64", parameters["roomId"].GetProperty("schema").GetProperty("format").GetString());
         var responses = operation.GetProperty("responses");
-        AssertProperties(responses, "200", "400", "401", "403", "429");
+        AssertProperties(responses, "200", "400", "401", "403", "429", "503");
         var responseSchema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/LoadResponse", responseSchema.GetProperty("$ref").GetString());
