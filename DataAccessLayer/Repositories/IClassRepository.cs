@@ -11,3 +11,22 @@ public interface IClassRepository : IGenericRepository<Class>
     Task<List<ScheduleRow>> GetScheduleRowsAsync(DateTime from, DateTime to, long? roomId, long userId,
         (DateTime StartsAt, long ClassId)? after, int take, CancellationToken ct = default);
 }
+
+public sealed record ScheduleRow(
+    long ClassId,
+    string Title,
+    DateTime StartsAt,
+    int DurationMinutes,
+    long RoomId,
+    string RoomName,
+    int Capacity,
+    int FreeSeats,
+    int MySeats);
+
+public sealed record LoadRow(
+    DateOnly Date,
+    long RoomId,
+    string RoomName,
+    int ClassesCount,
+    int TotalCapacity,
+    int BookedSeats);
