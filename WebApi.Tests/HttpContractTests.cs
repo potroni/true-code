@@ -4,13 +4,16 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using DataAccessLayer.Entities;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Auth;
 using WebApi.Contracts;
 using WebApi.Controllers;
+using WebApi.Middleware;
 
 namespace WebApi.Tests;
 
@@ -154,6 +157,34 @@ public class HttpContractTests
 
         var problem = await ReadProblemAsync(response, HttpStatusCode.Conflict);
         Assert.AreEqual("capacity-exceeded", problem.GetProperty("reason").GetString());
+    }
+
+    [TestMethod]
+    [DataRow("application/json")]
+    [DataRow("application/xml")]
+    public async Task UnhandledExceptionReturnsSafeProblemDetails(string accept)
+    {
+        const string failureMessage = "HTTP contract probe failure";
+        using var server = new TestServer(new WebHostBuilder()
+            .ConfigureServices(services => services.AddProblemDetails())
+            .Configure(app =>
+            {
+                app.UseMiddleware<ExceptionHandlingMiddleware>();
+                app.Run(ThrowUnhandledException);
+            }));
+        using var client = server.CreateClient();
+        client.DefaultRequestHeaders.Accept.ParseAdd(accept);
+        using var response = await client.GetAsync("/");
+
+        var problem = await ReadProblemAsync(response, HttpStatusCode.InternalServerError);
+        Assert.AreEqual("Internal server error", problem.GetProperty("title").GetString());
+        Assert.IsFalse(problem.TryGetProperty("detail", out _));
+        var body = problem.GetRawText();
+        Assert.IsFalse(body.Contains(failureMessage, StringComparison.Ordinal));
+        Assert.IsFalse(body.Contains(nameof(ThrowUnhandledException), StringComparison.Ordinal));
+
+        static Task ThrowUnhandledException(HttpContext _) =>
+            throw new InvalidOperationException(failureMessage);
     }
 
     private static HttpClient CreateClient(ContractApplicationFactory factory)
