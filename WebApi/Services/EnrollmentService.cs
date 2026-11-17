@@ -545,3 +545,25 @@ public abstract record CancelEnrollmentResult
 
     public sealed record Conflict(string Reason) : CancelEnrollmentResult;
 }
+
+public abstract record CancelWaitlistResult
+{
+    private CancelWaitlistResult() { }
+
+    public sealed record Success(CancelWaitlistResponse Response) : CancelWaitlistResult;
+
+    public sealed record NotFound : CancelWaitlistResult;
+
+    public sealed record Conflict(string Reason) : CancelWaitlistResult;
+}
+
+public abstract record JoinWaitlistResult
+{
+    private JoinWaitlistResult() { }
+
+    public sealed record Success(string ResponseBody) : JoinWaitlistResult;
+
+    public sealed record ClassNotFound : JoinWaitlistResult;
+
+    public sealed record Conflict(string Reason) : JoinWaitlistResult;
+}

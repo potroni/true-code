@@ -1,15 +1,14 @@
 using System.Globalization;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
-using StackExchange.Redis;
 using WebApi.Auth;
+using WebApi.Exceptions;
 using WebApi.Services;
 
 namespace WebApi.Middleware;
 
 internal sealed class BusinessRateLimitMiddleware(
     RequestDelegate next,
-    RedisBusinessRateLimiter limiter,
-    ILogger<BusinessRateLimitMiddleware> logger)
+    IBusinessRateLimiter limiter)
 {
     public async Task InvokeAsync(HttpContext context)
     {
@@ -22,9 +21,8 @@ internal sealed class BusinessRateLimitMiddleware(
             {
                 retryAfter = await limiter.CheckAsync(userId, context.RequestAborted);
             }
-            catch (Exception exception) when (exception is RedisConnectionException or RedisTimeoutException)
+            catch (BusinessRateLimiterUnavailableException)
             {
-                logger.LogWarning("Redis is unavailable for rate limiting ({ErrorType}).", exception.GetType().Name);
                 await WriteRejectionAsync(context, StatusCodes.Status503ServiceUnavailable);
                 return;
             }

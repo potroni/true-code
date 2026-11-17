@@ -1,9 +1,18 @@
 using System.Globalization;
 using StackExchange.Redis;
+using WebApi.Exceptions;
 
 namespace WebApi.Services;
 
-internal sealed class RedisBusinessRateLimiter(IConnectionMultiplexer connection, IConfiguration configuration)
+internal interface IBusinessRateLimiter
+{
+    Task<TimeSpan> CheckAsync(long userId, CancellationToken ct);
+}
+
+internal sealed class RedisRateLimitService(
+    IConnectionMultiplexer connection,
+    IConfiguration configuration,
+    ILogger<RedisRateLimitService> logger) : IBusinessRateLimiter
 {
     private readonly string _keyPrefix = configuration["RateLimiting:KeyPrefix"] ?? "truecode:rate-limit:";
 
@@ -33,10 +42,18 @@ internal sealed class RedisBusinessRateLimiter(IConnectionMultiplexer connection
     {
         ct.ThrowIfCancellationRequested();
         var key = _keyPrefix + userId.ToString(CultureInfo.InvariantCulture);
-        var result = await connection.GetDatabase()
-            .ScriptEvaluateAsync(ReadClock + CheckWindow, [key], [Guid.NewGuid().ToString("N")])
-            .WaitAsync(ct);
+        try
+        {
+            var result = await connection.GetDatabase()
+                .ScriptEvaluateAsync(ReadClock + CheckWindow, [key], [Guid.NewGuid().ToString("N")])
+                .WaitAsync(ct);
 
-        return TimeSpan.FromMicroseconds((long)result);
+            return TimeSpan.FromMicroseconds((long)result);
+        }
+        catch (Exception exception) when (exception is RedisConnectionException or RedisTimeoutException)
+        {
+            logger.LogWarning("Redis is unavailable for rate limiting ({ErrorType}).", exception.GetType().Name);
+            throw new BusinessRateLimiterUnavailableException(exception);
+        }
     }
 }

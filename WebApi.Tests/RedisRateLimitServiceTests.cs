@@ -12,7 +12,7 @@ using WebApi.Services;
 namespace WebApi.Tests;
 
 [TestClass]
-public class RedisBusinessRateLimiterTests
+public class RedisRateLimitServiceTests
 {
     private const string Schedule = "/schedule?from=2076-01-01T10:00:00Z&to=2076-01-01T11:00:00Z";
 
@@ -98,7 +98,7 @@ public class RedisBusinessRateLimiterTests
         var database = connection.GetDatabase();
         var key = $"tests:rate-limit:{Guid.NewGuid():N}:boundary";
         const long start = 1_700_000_000_000_000;
-        var script = "local now = tonumber(ARGV[2])\n" + RedisBusinessRateLimiter.CheckWindow;
+        var script = "local now = tonumber(ARGV[2])\n" + RedisRateLimitService.CheckWindow;
 
         async Task<long> EvaluateAsync(long now) => (long)await database.ScriptEvaluateAsync(
             script, [key], [Guid.NewGuid().ToString("N"), now]);

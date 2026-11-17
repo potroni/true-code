@@ -46,7 +46,7 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
     options.AsyncTimeout = 1000;
     return ConnectionMultiplexer.Connect(options);
 });
-builder.Services.AddSingleton<RedisBusinessRateLimiter>();
+builder.Services.AddSingleton<IBusinessRateLimiter, RedisRateLimitService>();
 
 builder.Services.AddSingleton<ICacheService>(provider =>
     new RedisCacheService(provider.GetRequiredService<IConnectionMultiplexer>(), TimeSpan.FromMinutes(5)));
