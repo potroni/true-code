@@ -39,15 +39,22 @@ public class ExceptionHandlingMiddleware
             context.Response.Clear();
             context.Response.StatusCode = StatusCodes.Status500InternalServerError;
 
-            await problemDetailsService.WriteAsync(new ProblemDetailsContext
+            var problem = new ProblemDetails
+            {
+                Status = StatusCodes.Status500InternalServerError,
+                Title = "Internal server error"
+            };
+
+            if (!await problemDetailsService.TryWriteAsync(new ProblemDetailsContext
             {
                 HttpContext = context,
-                ProblemDetails = new ProblemDetails
-                {
-                    Status = StatusCodes.Status500InternalServerError,
-                    Title = "Internal server error"
-                }
-            });
+                ProblemDetails = problem
+            }))
+            {
+                // решение: если ни один writer не поддерживает Accept, сохраняем формат ProblemDetails в JSON.
+                await context.Response.WriteAsJsonAsync(problem, options: null,
+                    contentType: "application/problem+json", cancellationToken: context.RequestAborted);
+            }
         }
     }
 }

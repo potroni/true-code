@@ -1,10 +1,11 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
+using WebApi.ModelBinding;
 
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Analytics;
 
-public sealed class LoadQuery : IValidatableObject
+public sealed class RoomLoadQuery : IValidatableObject
 {
     [BindRequired]
     [ModelBinder(Name = "from", BinderType = typeof(ContractDateModelBinder))]

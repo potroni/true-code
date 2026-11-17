@@ -6,6 +6,19 @@ namespace WebApi.Tests;
 
 public class ApiApplicationFactory : WebApplicationFactory<Program>
 {
+    private readonly string _rateLimitKeyPrefix;
+    private readonly string? _redisConnectionString;
+
+    public ApiApplicationFactory() : this($"tests:rate-limit:{Guid.NewGuid():N}:")
+    {
+    }
+
+    internal ApiApplicationFactory(string rateLimitKeyPrefix, string? redisConnectionString = null)
+    {
+        _rateLimitKeyPrefix = rateLimitKeyPrefix;
+        _redisConnectionString = redisConnectionString;
+    }
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");
@@ -15,7 +28,8 @@ public class ApiApplicationFactory : WebApplicationFactory<Program>
             configuration.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["ConnectionStrings:Postgres"] = TestDatabase.PostgresConnectionString,
-                ["ConnectionStrings:Redis"] = TestDatabase.RedisConnectionString
+                ["ConnectionStrings:Redis"] = _redisConnectionString ?? TestDatabase.RedisConnectionString,
+                ["RateLimiting:KeyPrefix"] = _rateLimitKeyPrefix
             });
         });
     }

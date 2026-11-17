@@ -1,5 +1,6 @@
 using DataAccessLayer.UnitOfWork;
-using WebApi.Contracts;
+using WebApi.Contracts.Schedule;
+using WebApi.Pagination;
 
 namespace WebApi.Services;
 

@@ -6,7 +6,8 @@ using DataAccessLayer.Entities;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using WebApi.Contracts;
+using WebApi.Contracts.Enrollments;
+using WebApi.Contracts.Waitlist;
 using WebApi.Services;
 
 namespace WebApi.Tests;
@@ -14,6 +15,20 @@ namespace WebApi.Tests;
 public partial class EnrollmentHttpContractTests
 {
     private const string WaitlistPath = "/enrollments/waitlist";
+
+    [TestMethod]
+    public async Task WaitlistOperationsStayInEnrollmentsOpenApiGroup()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var paths = document.GetProperty("paths");
+        var joinTags = paths.GetProperty(WaitlistPath).GetProperty("post").GetProperty("tags");
+        var cancelTags = paths.GetProperty(WaitlistPath + "/{id}/cancel").GetProperty("post").GetProperty("tags");
+        CollectionAssert.AreEqual(new[] { "Enrollments" }, joinTags.EnumerateArray().Select(tag => tag.GetString()).ToArray());
+        CollectionAssert.AreEqual(new[] { "Enrollments" }, cancelTags.EnumerateArray().Select(tag => tag.GetString()).ToArray());
+    }
 
     [TestMethod]
     public async Task CancellingBookingThroughApiPromotesFirstWaitlistedClientAndDebitsOnce()
@@ -33,7 +48,7 @@ public partial class EnrollmentHttpContractTests
         using var bookingRequest = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", Guid.NewGuid().ToString("N"));
         using var bookingResponse = await ownerClient.SendAsync(bookingRequest);
         Assert.AreEqual(HttpStatusCode.Created, bookingResponse.StatusCode);
-        var booking = await bookingResponse.Content.ReadFromJsonAsync<EnrollmentResponse>();
+        var booking = await bookingResponse.Content.ReadFromJsonAsync<CreateEnrollmentResponse>();
         Assert.IsNotNull(booking);
         var firstKey = Guid.NewGuid().ToString("N");
         using var firstJoinRequest = CreateWaitlistJoin(classId, seats: 2, firstKey);
@@ -125,7 +140,7 @@ public partial class EnrollmentHttpContractTests
         Assert.AreEqual(1, parameters.GetArrayLength());
         Assert.AreEqual("id", parameters[0].GetProperty("name").GetString());
         Assert.AreEqual("path", parameters[0].GetProperty("in").GetString());
-        AssertProperties(operation.GetProperty("responses"), "200", "400", "401", "404", "409", "429");
+        AssertProperties(operation.GetProperty("responses"), "200", "400", "401", "404", "409", "429", "503");
         var properties = document.GetProperty("components").GetProperty("schemas")
             .GetProperty("CancelWaitlistResponse").GetProperty("properties");
         AssertProperties(properties, "id", "status");
@@ -331,7 +346,7 @@ public partial class EnrollmentHttpContractTests
         Assert.IsTrue(operation.GetProperty("requestBody").GetProperty("required").GetBoolean());
 
         var responses = operation.GetProperty("responses");
-        AssertProperties(responses, "201", "400", "401", "404", "409", "429");
+        AssertProperties(responses, "201", "400", "401", "404", "409", "429", "503");
         var schema = responses.GetProperty("201").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/JoinWaitlistResponse", schema.GetProperty("$ref").GetString());

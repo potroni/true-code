@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using WebApi.Auth;
+using WebApi.Contracts.Auth;
 
 namespace WebApi.Controllers;
 

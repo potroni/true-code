@@ -1,5 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
-using WebApi.Contracts;
+using WebApi.Contracts.Schedule;
 using WebApi.Services;
 
 namespace WebApi.Controllers;
@@ -11,8 +11,6 @@ public sealed class ScheduleController(IScheduleService scheduleService) : BaseA
     [HttpGet]
     [ProducesResponseType<ScheduleResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<ScheduleResponse>> Get([FromQuery] ScheduleQuery query, CancellationToken ct) =>
         Ok(await scheduleService.GetPageAsync(query, CurrentUserId, ct));
 }

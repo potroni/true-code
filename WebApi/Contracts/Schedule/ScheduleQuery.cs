@@ -2,8 +2,10 @@ using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
+using WebApi.ModelBinding;
+using WebApi.Pagination;
 
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Schedule;
 
 public sealed class ScheduleQuery : IValidatableObject
 {

@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using Microsoft.AspNetCore.WebUtilities;
 
-namespace WebApi.Contracts;
+namespace WebApi.Pagination;
 
 internal readonly record struct ScheduleCursor(DateTime StartsAt, long ClassId)
 {

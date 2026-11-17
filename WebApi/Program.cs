@@ -10,6 +10,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using StackExchange.Redis;
 using WebApi.Auth;
+using WebApi.Contracts.Analytics;
+using WebApi.Contracts.Enrollments;
 using WebApi.Middleware;
 using WebApi.Services;
 
@@ -23,7 +25,18 @@ builder.Host.UseDefaultServiceProvider(options =>
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(options =>
+{
+    var defaultSchemaId = options.SchemaGeneratorOptions.SchemaIdSelector;
+    options.CustomSchemaIds(type => type switch
+    {
+        _ when type == typeof(CreateEnrollmentRequest) => "ClassSeatsRequest",
+        _ when type == typeof(CreateEnrollmentResponse) => "EnrollmentResponse",
+        _ when type == typeof(ChangeEnrollmentSeatsRequest) => "ChangeSeatsRequest",
+        _ when type == typeof(RoomLoadResponse) => "LoadResponse",
+        _ => defaultSchemaId(type)
+    });
+});
 builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
 builder.Services.AddSingleton(TimeProvider.System);
@@ -32,12 +45,23 @@ builder.Services.AddDbContext<ClubDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("Postgres")));
 
 builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
+builder.Services.AddScoped<IdempotentWriteExecutor>();
 builder.Services.AddScoped<IEnrollmentService, EnrollmentService>();
+builder.Services.AddScoped<IWaitlistService, WaitlistService>();
 builder.Services.AddScoped<IScheduleService, ScheduleService>();
 builder.Services.AddScoped<IAnalyticsService, AnalyticsService>();
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
-    ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")!));
+{
+    // решение: API запускается без Redis и возвращает 503 для бизнес-запросов до восстановления соединения.
+    var options = ConfigurationOptions.Parse(builder.Configuration.GetConnectionString("Redis")!);
+    options.AbortOnConnectFail = false;
+    options.ConnectRetry = 0;
+    options.BacklogPolicy = BacklogPolicy.FailFast;
+    options.AsyncTimeout = 1000;
+    return ConnectionMultiplexer.Connect(options);
+});
+builder.Services.AddSingleton<IBusinessRateLimiter, RedisRateLimitService>();
 
 builder.Services.AddSingleton<ICacheService>(provider =>
     new RedisCacheService(provider.GetRequiredService<IConnectionMultiplexer>(), TimeSpan.FromMinutes(5)));
@@ -96,8 +120,6 @@ app.UseAuthorization();
 
 app.MapControllers();
 app.MapHealthChecks("/health");
-
-app.Services.GetRequiredService<IConnectionMultiplexer>();
 
 using (var scope = app.Services.CreateScope())
 {

@@ -7,7 +7,8 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Auth;
-using WebApi.Contracts;
+using WebApi.Contracts.Schedule;
+using WebApi.Pagination;
 using WebApi.Services;
 
 namespace WebApi.Tests;
@@ -161,7 +162,7 @@ public class ScheduleHttpContractTests
         Assert.AreEqual(100, limit.GetProperty("maximum").GetInt32());
 
         var responses = operation.GetProperty("responses");
-        AssertProperties(responses, "200", "400", "401", "429");
+        AssertProperties(responses, "200", "400", "401", "429", "503");
         var schema = responses.GetProperty("200").GetProperty("content")
             .GetProperty("application/json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/ScheduleResponse", schema.GetProperty("$ref").GetString());

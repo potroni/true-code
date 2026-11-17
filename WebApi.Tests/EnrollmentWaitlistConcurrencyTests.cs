@@ -6,7 +6,7 @@ using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
-using WebApi.Contracts;
+using WebApi.Contracts.Waitlist;
 
 namespace WebApi.Tests;
 

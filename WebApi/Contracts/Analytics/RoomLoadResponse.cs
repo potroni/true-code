@@ -1,8 +1,8 @@
 using System.Text.Json.Serialization;
 
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Analytics;
 
-public sealed record LoadResponse([property: JsonRequired] IReadOnlyList<LoadItemResponse> Items);
+public sealed record RoomLoadResponse([property: JsonRequired] IReadOnlyList<LoadItemResponse> Items);
 
 public sealed record LoadItemResponse(
     DateOnly Date,

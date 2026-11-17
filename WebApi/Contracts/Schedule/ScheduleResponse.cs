@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Schedule;
 
 public sealed record ScheduleResponse(
     [property: JsonRequired] IReadOnlyList<ScheduleItemResponse> Items,

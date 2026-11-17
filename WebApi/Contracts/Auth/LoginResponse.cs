@@ -1,4 +1,4 @@
-namespace WebApi.Auth;
+namespace WebApi.Contracts.Auth;
 
 public class LoginResponse
 {

@@ -68,7 +68,7 @@ public class BookingLocksTests
             db.AddRange(waiting, otherEnrollment, cancelledEnrollment);
             await db.SaveChangesAsync();
 
-            var service = new EnrollmentService(unit, new TestClock(now));
+            var service = new EnrollmentService(unit, new TestClock(now), new IdempotentWriteExecutor(unit));
             var result = await service.ChangeSeatsAsync(enrollment.Id, enrollment.UserId, seats, default);
             var expectedSeats = expectedConflict is null ? seats : enrollment.Seats;
             var expectedVisits = remainingVisits - (expectedSeats - enrollment.Seats);
@@ -113,7 +113,7 @@ public class BookingLocksTests
         var db = scope.ServiceProvider.GetRequiredService<ClubDbContext>();
         var unit = changeScope.ServiceProvider.GetRequiredService<IUnitOfWork>();
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
-        var service = new EnrollmentService(unit, new TestClock(now));
+        var service = new EnrollmentService(unit, new TestClock(now), new IdempotentWriteExecutor(unit));
 
         var enrollment = await AddEnrollmentAsync(db, classStarted ? now : now.AddHours(1));
         enrollment.Status = status;
@@ -163,7 +163,7 @@ public class BookingLocksTests
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
         var clock = new TestClock(now);
         var enrollment = await AddEnrollmentAsync(db, now.AddHours(1));
-        var service = new EnrollmentService(change, clock);
+        var service = new EnrollmentService(change, clock, new IdempotentWriteExecutor(change));
         var pass = await db.Passes.AsNoTracking().SingleAsync(x => x.UserId == enrollment.UserId);
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -361,7 +361,7 @@ public class BookingLocksTests
         Task<CancelEnrollmentResult>? request = null;
         try
         {
-            var service = new EnrollmentService(cancellation, clock);
+            var service = new EnrollmentService(cancellation, clock, new IdempotentWriteExecutor(cancellation));
             Assert.AreEqual(new CancelEnrollmentResult.NotFound(),
                 await service.CancelAsync(enrollment.Id, candidate.UserId, ct));
 

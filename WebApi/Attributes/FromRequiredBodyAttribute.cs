@@ -1,7 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 
-namespace WebApi.Contracts;
+namespace WebApi.Attributes;
 
 [AttributeUsage(AttributeTargets.Parameter)]
 public sealed class FromRequiredBodyAttribute : FromBodyAttribute

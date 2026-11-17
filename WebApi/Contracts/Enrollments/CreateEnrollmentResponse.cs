@@ -1,6 +1,6 @@
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Enrollments;
 
-public sealed record EnrollmentResponse(
+public sealed record CreateEnrollmentResponse(
     long Id,
     long ClassId,
     int Seats,

@@ -1,4 +1,4 @@
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Enrollments;
 
 public sealed record EnrollmentDetailsResponse(
     long Id,
