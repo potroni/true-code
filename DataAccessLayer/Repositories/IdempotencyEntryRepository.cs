@@ -32,6 +32,7 @@ internal sealed class IdempotencyEntryRepository(DbSet<IdempotencyEntry> dbSet, 
         if (!string.Equals(entry.OriginalKey, key, StringComparison.Ordinal))
             throw new InvalidOperationException("Idempotency key hash collision.");
 
+        // решение: сравниваем значения classId и seats, чтобы порядок полей и пробелы в JSON не влияли на повтор.
         if (entry.ClassId != classId || entry.Seats != seats)
             return new(IdempotencyLookupStatus.ParameterConflict);
 
