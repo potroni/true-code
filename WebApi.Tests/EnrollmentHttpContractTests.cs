@@ -1128,7 +1128,9 @@ public partial class EnrollmentHttpContractTests
     [DataRow("class")]
     [DataRow("pass")]
     [DataRow("occupied seats")]
-    public async Task CreateRejectsClassThatStartsWhileCheckingAvailability(string blockedRead)
+    [DataRow("enrollment write")]
+    [DataRow("journal write")]
+    public async Task CreateRejectsClassThatStartsWhileWaitingForDatabase(string blockedOperation)
     {
         var now = new DateTimeOffset(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
         var clock = new AdjustableTimeProvider(now);
@@ -1145,12 +1147,26 @@ public partial class EnrollmentHttpContractTests
         var ct = timeout.Token;
 
         await using var gate = await db.Database.BeginTransactionAsync(ct);
-        if (blockedRead == "pass")
-            Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
-        else if (blockedRead == "occupied seats")
-            await db.Database.ExecuteSqlRawAsync("LOCK TABLE enrollments IN ACCESS EXCLUSIVE MODE", ct);
-        else
-            Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+        switch (blockedOperation)
+        {
+            case "class":
+                Assert.IsNotNull(await unitOfWork.Class.LockByIdAsync(classId, ct));
+                break;
+            case "pass":
+                Assert.HasCount(1, await unitOfWork.Pass.LockByUsersAsync([userId], ct));
+                break;
+            case "occupied seats":
+                await db.Database.ExecuteSqlRawAsync("LOCK TABLE enrollments IN ACCESS EXCLUSIVE MODE", ct);
+                break;
+            case "enrollment write":
+                await db.Database.ExecuteSqlRawAsync("LOCK TABLE enrollments IN SHARE MODE", ct);
+                break;
+            case "journal write":
+                await db.Database.ExecuteSqlRawAsync("LOCK TABLE idempotency_entries IN SHARE MODE", ct);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(blockedOperation));
+        }
 
         var pendingResponse = client.SendAsync(request, ct);
         try

@@ -394,15 +394,7 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
         var requestedAt = timeProvider.GetUtcNow().UtcDateTime;
         return await ExecuteIdempotentAsync<CreateEnrollmentResult>(
             userId, IdempotencyOperation.CreateEnrollment, idempotencyKey, classId, seats, ToExistingResult,
-            async () =>
-            {
-                var (pass, rejection) = await CheckAvailabilityUnderLocksAsync(userId, classId, seats, requestedAt, ct);
-                if (rejection is not null)
-                    return (rejection, null, null);
-
-                var body = await SaveEnrollmentAsync(pass!, userId, classId, seats, requestedAt, ct);
-                return (new CreateEnrollmentResult.Success(body), body, null);
-            },
+            () => CreateUnderClassLockAsync(userId, classId, seats, requestedAt, ct),
             ct);
     }
 
@@ -455,18 +447,26 @@ internal sealed class EnrollmentService(IUnitOfWork unitOfWork, TimeProvider tim
             journal.FindAsync(userId, operation, key, classId, seats, ct);
     }
 
-    private async Task<(Pass? Pass, CreateEnrollmentResult? Rejection)> CheckAvailabilityUnderLocksAsync(
+    private async Task<(CreateEnrollmentResult Result, string? ResponseBody, Func<CreateEnrollmentResult?>? ValidateBeforeCommit)>
+        CreateUnderClassLockAsync(
         long userId, long classId, int seats, DateTime requestedAt, CancellationToken ct)
     {
         var activity = await unitOfWork.Class.LockByIdAsync(classId, ct);
         if (activity is null)
-            return (null, new CreateEnrollmentResult.ClassNotFound());
+            return (new CreateEnrollmentResult.ClassNotFound(), null, null);
         if (activity.IsCancelled)
-            return (null, new CreateEnrollmentResult.Conflict("class-cancelled"));
+            return (new CreateEnrollmentResult.Conflict("class-cancelled"), null, null);
 
         var pass = await LockPassAsync(userId, ct);
         var reason = await GetAdditionalSeatsConflictAsync(activity, pass, seats, requestedAt, ct);
-        return reason is null ? (pass, null) : (null, new CreateEnrollmentResult.Conflict(reason));
+        if (reason is not null)
+            return (new CreateEnrollmentResult.Conflict(reason), null, null);
+
+        var body = await SaveEnrollmentAsync(pass, userId, classId, seats, requestedAt, ct);
+        return (new CreateEnrollmentResult.Success(body), body, RejectIfStarted);
+
+        CreateEnrollmentResult? RejectIfStarted() =>
+            HasStarted(activity) ? new CreateEnrollmentResult.Conflict("class-started") : null;
     }
 
     private async Task<Pass> LockPassAsync(long userId, CancellationToken ct) =>
