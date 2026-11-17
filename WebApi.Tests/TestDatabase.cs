@@ -1,5 +1,4 @@
 using Npgsql;
-using StackExchange.Redis;
 
 namespace WebApi.Tests;
 
@@ -39,21 +38,6 @@ public static class TestDatabase
         {
             Database = _databaseName
         }.ConnectionString;
-
-        await FlushCacheAsync();
-    }
-
-    private static async Task FlushCacheAsync()
-    {
-        var options = ConfigurationOptions.Parse(RedisConnectionString);
-        options.AllowAdmin = true;
-
-        using var connection = await ConnectionMultiplexer.ConnectAsync(options);
-
-        foreach (var endpoint in connection.GetEndPoints())
-        {
-            await connection.GetServer(endpoint).FlushDatabaseAsync(options.DefaultDatabase ?? 0);
-        }
     }
 
     [AssemblyCleanup]
