@@ -7,13 +7,14 @@ namespace WebApi.Contracts;
 public sealed class LoadQuery : IValidatableObject
 {
     [BindRequired]
-    [ModelBinder(BinderType = typeof(ContractDateModelBinder))]
+    [ModelBinder(Name = "from", BinderType = typeof(ContractDateModelBinder))]
     public DateOnly From { get; init; }
 
     [BindRequired]
-    [ModelBinder(BinderType = typeof(ContractDateModelBinder))]
+    [ModelBinder(Name = "to", BinderType = typeof(ContractDateModelBinder))]
     public DateOnly To { get; init; }
 
+    [ModelBinder(Name = "roomId", BinderType = typeof(OptionalLongQueryModelBinder))]
     public long? RoomId { get; init; }
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)

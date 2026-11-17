@@ -37,6 +37,53 @@ public class ClassRepository : GenericRepository<Class>, IClassRepository
             .FirstOrDefaultAsync(x => x.Id == id, ct);
     }
 
+    public IQueryable<Class> QueryClassesForLoad(DateOnly from, DateOnly to, long? roomId)
+    {
+        var fromUtc = from.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+        // решение: задаем минимальную границу литералом, чтобы Npgsql не передал ее как -infinity.
+        var classes = from == DateOnly.MinValue
+            ? _dbSet.FromSqlRaw("SELECT * FROM classes WHERE starts_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00'")
+            : _dbSet.Where(x => x.StartsAt >= fromUtc);
+
+        if (to < DateOnly.MaxValue)
+        {
+            var untilUtc = to.AddDays(1).ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc);
+            classes = classes.Where(x => x.StartsAt < untilUtc);
+        }
+        else
+        {
+            // решение: используем последнюю хранимую микросекунду, так как следующая полночь вне диапазона DateTime.
+            var lastMicrosecondUtc = to.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)
+                .AddTicks(TimeSpan.TicksPerDay - TimeSpan.TicksPerMicrosecond);
+            classes = classes.Where(x => x.StartsAt <= lastMicrosecondUtc);
+        }
+
+        if (roomId is long room)
+            classes = classes.Where(x => x.RoomId == room);
+
+        return classes.AsNoTracking();
+    }
+
+    public Task<List<LoadRow>> GetLoadRowsAsync(DateOnly from, DateOnly to, long? roomId,
+        CancellationToken ct = default)
+    {
+        return QueryClassesForLoad(from, to, roomId)
+            .Select(x => new
+            {
+                Date = DateOnly.FromDateTime(x.StartsAt),
+                x.RoomId,
+                RoomName = x.Room.Name,
+                x.Capacity,
+                BookedSeats = x.Enrollments.Where(e => e.Status == "active").Sum(e => (long)e.Seats)
+            })
+            .GroupBy(x => new { x.Date, x.RoomId, x.RoomName })
+            .OrderBy(group => group.Key.Date)
+            .ThenBy(group => group.Key.RoomId)
+            .Select(group => new LoadRow(group.Key.Date, group.Key.RoomId, group.Key.RoomName,
+                group.Count(), (int)group.Sum(x => (long)x.Capacity), (int)group.Sum(x => x.BookedSeats)))
+            .ToListAsync(ct);
+    }
+
     public Task<List<ScheduleRow>> GetScheduleRowsAsync(DateTime from, DateTime to, long? roomId, long userId,
         (DateTime StartsAt, long ClassId)? after, int take, CancellationToken ct = default)
     {
