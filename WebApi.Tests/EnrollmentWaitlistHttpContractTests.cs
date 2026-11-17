@@ -16,6 +16,20 @@ public partial class EnrollmentHttpContractTests
     private const string WaitlistPath = "/enrollments/waitlist";
 
     [TestMethod]
+    public async Task WaitlistOperationsStayInEnrollmentsOpenApiGroup()
+    {
+        using var factory = new EnrollmentApplicationFactory(new EnrollmentServiceStub());
+        using var client = factory.CreateClient();
+
+        var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
+        var paths = document.GetProperty("paths");
+        var joinTags = paths.GetProperty(WaitlistPath).GetProperty("post").GetProperty("tags");
+        var cancelTags = paths.GetProperty(WaitlistPath + "/{id}/cancel").GetProperty("post").GetProperty("tags");
+        CollectionAssert.AreEqual(new[] { "Enrollments" }, joinTags.EnumerateArray().Select(tag => tag.GetString()).ToArray());
+        CollectionAssert.AreEqual(new[] { "Enrollments" }, cancelTags.EnumerateArray().Select(tag => tag.GetString()).ToArray());
+    }
+
+    [TestMethod]
     public async Task CancellingBookingThroughApiPromotesFirstWaitlistedClientAndDebitsOnce()
     {
         var now = new DateTimeOffset(2026, 11, 16, 8, 0, 0, TimeSpan.Zero);
