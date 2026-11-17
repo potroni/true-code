@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using WebApi.Attributes;
 using WebApi.Auth;
 using WebApi.Contracts;
 using WebApi.Controllers;

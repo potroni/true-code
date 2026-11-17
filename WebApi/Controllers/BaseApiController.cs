@@ -1,7 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using WebApi.Attributes;
 using WebApi.Auth;
-using WebApi.Middleware;
 
 namespace WebApi.Controllers;
 

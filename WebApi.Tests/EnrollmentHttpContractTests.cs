@@ -1765,7 +1765,10 @@ public partial class EnrollmentHttpContractTests
         {
             base.ConfigureWebHost(builder);
             builder.ConfigureTestServices(services =>
-                services.Replace(ServiceDescriptor.Singleton<IEnrollmentService>(service)));
+            {
+                services.Replace(ServiceDescriptor.Singleton<IEnrollmentService>(service));
+                services.Replace(ServiceDescriptor.Singleton<IWaitlistService>(service));
+            });
         }
     }
 
@@ -1814,7 +1817,7 @@ public partial class EnrollmentHttpContractTests
         public void SetUtcNow(DateTimeOffset value) => Interlocked.Exchange(ref _utcTicks, value.UtcTicks);
     }
 
-    private sealed class EnrollmentServiceStub : IEnrollmentService
+    private sealed class EnrollmentServiceStub : IEnrollmentService, IWaitlistService
     {
         public static readonly DateTimeOffset CreatedAt = new(2026, 11, 15, 8, 0, 0, TimeSpan.Zero);
 

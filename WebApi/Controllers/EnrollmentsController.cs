@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
+using WebApi.Attributes;
 using WebApi.Contracts;
 using WebApi.Services;
 
@@ -7,7 +8,8 @@ namespace WebApi.Controllers;
 
 [ApiController]
 [Route("enrollments")]
-public sealed class EnrollmentsController(IEnrollmentService enrollmentService) : BaseApiController
+public sealed class EnrollmentsController(IEnrollmentService enrollmentService, IWaitlistService waitlistService)
+    : BaseApiController
 {
     [HttpPost("waitlist")]
     [ProducesResponseType<JoinWaitlistResponse>(StatusCodes.Status201Created)]
@@ -19,7 +21,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
         CancellationToken ct)
     {
-        var result = await enrollmentService.JoinWaitlistAsync(
+        var result = await waitlistService.JoinWaitlistAsync(
             CurrentUserId, request.ClassId, request.Seats, idempotencyKey, ct);
 
         return result switch
@@ -43,7 +45,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     public async Task<ActionResult<CancelWaitlistResponse>> CancelWaitlist([FromRoute] long id, CancellationToken ct)
     {
-        var result = await enrollmentService.CancelWaitlistAsync(id, CurrentUserId, ct);
+        var result = await waitlistService.CancelWaitlistAsync(id, CurrentUserId, ct);
 
         return result switch
         {
