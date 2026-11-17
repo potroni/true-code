@@ -792,11 +792,18 @@ public partial class EnrollmentHttpContractTests
         }
 
         using var client = CreateAuthenticatedClient(factory, userId);
-        using var replay = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", key);
-        using var replayResponse = await client.SendAsync(replay);
-        Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
-        Assert.AreEqual("application/json", replayResponse.Content.Headers.ContentType?.MediaType);
-        Assert.AreEqual(storedBody, await replayResponse.Content.ReadAsStringAsync());
+        foreach (var body in new[]
+        {
+            $$"""{"classId":{{classId}},"seats":2}""",
+            $$""" { "seats": 2, "classId": {{classId}} } """
+        })
+        {
+            using var replay = CreateRequest(body, key);
+            using var replayResponse = await client.SendAsync(replay);
+            Assert.AreEqual(HttpStatusCode.Created, replayResponse.StatusCode);
+            Assert.AreEqual("application/json", replayResponse.Content.Headers.ContentType?.MediaType);
+            Assert.AreEqual(storedBody, await replayResponse.Content.ReadAsStringAsync());
+        }
 
         foreach (var body in new[]
         {
