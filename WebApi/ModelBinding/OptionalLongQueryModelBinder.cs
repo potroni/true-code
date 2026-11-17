@@ -1,7 +1,7 @@
 using System.Globalization;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 
-namespace WebApi.Contracts;
+namespace WebApi.ModelBinding;
 
 public sealed class OptionalLongQueryModelBinder : IModelBinder
 {

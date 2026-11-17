@@ -2,7 +2,7 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 
-namespace WebApi.Contracts;
+namespace WebApi.ModelBinding;
 
 public sealed partial class ContractDateModelBinder : IModelBinder
 {

@@ -1,7 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
 using WebApi.Attributes;
-using WebApi.Contracts;
+using WebApi.Contracts.Waitlist;
 using WebApi.Services;
 
 namespace WebApi.Controllers;

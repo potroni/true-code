@@ -1,7 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using WebApi.Auth;
-using WebApi.Contracts;
+using WebApi.Contracts.Analytics;
 using WebApi.Services;
 
 namespace WebApi.Controllers;
@@ -12,9 +12,9 @@ namespace WebApi.Controllers;
 public sealed class AnalyticsController(IAnalyticsService analyticsService) : BaseApiController
 {
     [HttpGet("load")]
-    [ProducesResponseType<LoadResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<RoomLoadResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ValidationProblemDetails>(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status403Forbidden)]
-    public async Task<ActionResult<LoadResponse>> GetLoad([FromQuery(Name = "")] LoadQuery query, CancellationToken ct) =>
+    public async Task<ActionResult<RoomLoadResponse>> GetLoad([FromQuery(Name = "")] RoomLoadQuery query, CancellationToken ct) =>
         Ok(await analyticsService.GetLoadAsync(query, ct));
 }

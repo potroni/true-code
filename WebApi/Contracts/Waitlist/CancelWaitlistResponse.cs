@@ -1,4 +1,4 @@
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Waitlist;
 
 public sealed record CancelWaitlistResponse(long Id)
 {

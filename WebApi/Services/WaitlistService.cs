@@ -4,7 +4,7 @@ using DataAccessLayer.Entities;
 using DataAccessLayer.Repositories;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
-using WebApi.Contracts;
+using WebApi.Contracts.Waitlist;
 
 namespace WebApi.Services;
 

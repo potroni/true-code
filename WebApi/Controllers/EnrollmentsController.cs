@@ -1,7 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using Microsoft.AspNetCore.Mvc;
 using WebApi.Attributes;
-using WebApi.Contracts;
+using WebApi.Contracts.Enrollments;
 using WebApi.Services;
 
 namespace WebApi.Controllers;
@@ -32,7 +32,7 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
     public async Task<ActionResult<EnrollmentDetailsResponse>> ChangeSeats(
         [FromRoute] long id,
-        [FromRequiredBody, Required] ChangeSeatsRequest request,
+        [FromRequiredBody, Required] ChangeEnrollmentSeatsRequest request,
         CancellationToken ct)
     {
         var result = await enrollmentService.ChangeSeatsAsync(id, CurrentUserId, request.Seats, ct);
@@ -67,12 +67,12 @@ public sealed class EnrollmentsController(IEnrollmentService enrollmentService) 
     }
 
     [HttpPost]
-    [ProducesResponseType<EnrollmentResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<CreateEnrollmentResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
-    public async Task<ActionResult<EnrollmentResponse>> Create(
-        [FromRequiredBody] ClassSeatsRequest request,
+    public async Task<ActionResult<CreateEnrollmentResponse>> Create(
+        [FromRequiredBody] CreateEnrollmentRequest request,
         [FromHeader(Name = "Idempotency-Key"), Required] string idempotencyKey,
         CancellationToken ct)
     {

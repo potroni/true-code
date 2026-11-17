@@ -5,7 +5,8 @@ using DataAccessLayer.UnitOfWork;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
-using WebApi.Contracts;
+using WebApi.Contracts.Schedule;
+using WebApi.Pagination;
 using WebApi.Services;
 
 namespace WebApi.Tests;

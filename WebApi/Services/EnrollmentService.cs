@@ -5,7 +5,7 @@ using DataAccessLayer.Repositories;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
-using WebApi.Contracts;
+using WebApi.Contracts.Enrollments;
 
 namespace WebApi.Services;
 
@@ -340,7 +340,7 @@ internal sealed class EnrollmentService(
         pass.RemainingVisits -= seats;
         await unitOfWork.SaveChangesAsync(ct);
 
-        var response = new EnrollmentResponse(
+        var response = new CreateEnrollmentResponse(
             enrollment.Id, enrollment.ClassId, enrollment.Seats, enrollment.Status, enrollment.CreatedAt);
         return JsonSerializer.Serialize(response, JsonSerializerOptions.Web);
     }

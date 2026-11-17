@@ -1,4 +1,4 @@
-namespace WebApi.Contracts;
+namespace WebApi.Contracts.Waitlist;
 
 public sealed record JoinWaitlistResponse(
     long Id,

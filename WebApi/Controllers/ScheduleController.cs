@@ -1,5 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
-using WebApi.Contracts;
+using WebApi.Contracts.Schedule;
 using WebApi.Services;
 
 namespace WebApi.Controllers;

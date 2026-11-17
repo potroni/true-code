@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Auth;
+using WebApi.Contracts.Auth;
 using WebApi.Controllers;
 
 namespace WebApi.Tests;

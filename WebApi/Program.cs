@@ -10,6 +10,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using StackExchange.Redis;
 using WebApi.Auth;
+using WebApi.Contracts.Analytics;
+using WebApi.Contracts.Enrollments;
 using WebApi.Middleware;
 using WebApi.Services;
 
@@ -23,7 +25,18 @@ builder.Host.UseDefaultServiceProvider(options =>
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(options =>
+{
+    var defaultSchemaId = options.SchemaGeneratorOptions.SchemaIdSelector;
+    options.CustomSchemaIds(type => type switch
+    {
+        _ when type == typeof(CreateEnrollmentRequest) => "ClassSeatsRequest",
+        _ when type == typeof(CreateEnrollmentResponse) => "EnrollmentResponse",
+        _ when type == typeof(ChangeEnrollmentSeatsRequest) => "ChangeSeatsRequest",
+        _ when type == typeof(RoomLoadResponse) => "LoadResponse",
+        _ => defaultSchemaId(type)
+    });
+});
 builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
 builder.Services.AddSingleton(TimeProvider.System);

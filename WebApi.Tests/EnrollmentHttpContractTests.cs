@@ -15,7 +15,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using WebApi.Auth;
-using WebApi.Contracts;
+using WebApi.Contracts.Enrollments;
 using WebApi.Services;
 
 namespace WebApi.Tests;
@@ -33,9 +33,16 @@ public partial class EnrollmentHttpContractTests
         using var client = factory.CreateClient();
 
         var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
-        var responses = document.GetProperty("paths").GetProperty("/enrollments").GetProperty("post")
-            .GetProperty("responses");
+        var operation = document.GetProperty("paths").GetProperty("/enrollments").GetProperty("post");
+        var requestSchema = operation.GetProperty("requestBody").GetProperty("content")
+            .GetProperty("application/json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/ClassSeatsRequest", requestSchema.GetProperty("$ref").GetString());
+
+        var responses = operation.GetProperty("responses");
         AssertProperties(responses, "201", "400", "401", "404", "409", "429", "503");
+        var responseSchema = responses.GetProperty("201").GetProperty("content")
+            .GetProperty("application/json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/EnrollmentResponse", responseSchema.GetProperty("$ref").GetString());
         var schema = responses.GetProperty("429").GetProperty("content")
             .GetProperty("application/problem+json").GetProperty("schema");
         Assert.AreEqual("#/components/schemas/ProblemDetails", schema.GetProperty("$ref").GetString());
@@ -335,6 +342,9 @@ public partial class EnrollmentHttpContractTests
         var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
         var operation = document.GetProperty("paths").GetProperty("/enrollments/{id}/seats").GetProperty("post");
         Assert.IsTrue(operation.GetProperty("requestBody").GetProperty("required").GetBoolean());
+        var requestSchema = operation.GetProperty("requestBody").GetProperty("content")
+            .GetProperty("application/json").GetProperty("schema");
+        Assert.AreEqual("#/components/schemas/ChangeSeatsRequest", requestSchema.GetProperty("$ref").GetString());
 
         var responses = operation.GetProperty("responses");
         CollectionAssert.AreEquivalent(new[] { "200", "400", "401", "404", "409", "429", "503" },
@@ -729,8 +739,8 @@ public partial class EnrollmentHttpContractTests
                 .Where(entry => entry.UserId == user.Id && entry.Status == "active")
                 .OrderByDescending(entry => entry.Id).FirstAsync();
             Assert.AreEqual(storedTime.UtcDateTime, enrollment.CreatedAt);
-            var expected = new EnrollmentResponse(enrollment.Id, classId, seats, "active", storedTime);
-            Assert.AreEqual(expected, JsonSerializer.Deserialize<EnrollmentResponse>(body, JsonSerializerOptions.Web));
+            var expected = new CreateEnrollmentResponse(enrollment.Id, classId, seats, "active", storedTime);
+            Assert.AreEqual(expected, JsonSerializer.Deserialize<CreateEnrollmentResponse>(body, JsonSerializerOptions.Web));
 
             using var replay = CreateRequest($$"""{"classId":{{classId}},"seats":{{seats}}}""", key);
             using var replayResponse = await client.SendAsync(replay);
@@ -1095,7 +1105,7 @@ public partial class EnrollmentHttpContractTests
         using var created = await client.SendAsync(request);
         Assert.AreEqual(HttpStatusCode.Created, created.StatusCode);
         var original = await created.Content.ReadAsByteArrayAsync();
-        var booking = JsonSerializer.Deserialize<EnrollmentResponse>(original, JsonSerializerOptions.Web);
+        var booking = JsonSerializer.Deserialize<CreateEnrollmentResponse>(original, JsonSerializerOptions.Web);
         Assert.IsNotNull(booking);
 
         var enrollment = await db.Set<Enrollment>().SingleAsync(entry => entry.Id == booking.Id);
@@ -1277,7 +1287,7 @@ public partial class EnrollmentHttpContractTests
             using var response = await client.SendAsync(request);
             Assert.AreEqual(HttpStatusCode.Created, response.StatusCode);
             var responseBody = await response.Content.ReadAsStringAsync();
-            var booking = JsonSerializer.Deserialize<EnrollmentResponse>(responseBody, JsonSerializerOptions.Web);
+            var booking = JsonSerializer.Deserialize<CreateEnrollmentResponse>(responseBody, JsonSerializerOptions.Web);
             Assert.IsNotNull(booking);
             var enrolledUser = await db.Set<Enrollment>().Where(entry => entry.Id == booking.Id)
                 .Select(entry => entry.UserId).SingleAsync();
@@ -1363,7 +1373,7 @@ public partial class EnrollmentHttpContractTests
                 entry => entry.ClassId == firstClass || entry.ClassId == secondClass, ct);
             Assert.AreEqual((winnerUser, winnerClass, seats, "active"),
                 (persisted.UserId, persisted.ClassId, persisted.Seats, persisted.Status));
-            var enrollment = JsonSerializer.Deserialize<EnrollmentResponse>(winnerBody, JsonSerializerOptions.Web);
+            var enrollment = JsonSerializer.Deserialize<CreateEnrollmentResponse>(winnerBody, JsonSerializerOptions.Web);
             Assert.IsNotNull(enrollment);
             Assert.AreEqual(persisted.Id, enrollment.Id);
             var journal = await db.Set<IdempotencyEntry>().SingleAsync(
@@ -1877,7 +1887,7 @@ public partial class EnrollmentHttpContractTests
             long userId, long classId, int seats, string idempotencyKey, CancellationToken ct)
         {
             Arguments = (userId, classId, seats, idempotencyKey);
-            var response = new EnrollmentResponse(123, classId, seats, "active", CreatedAt);
+            var response = new CreateEnrollmentResponse(123, classId, seats, "active", CreatedAt);
             var body = JsonSerializer.Serialize(response, JsonSerializerOptions.Web);
             return Task.FromResult<CreateEnrollmentResult>(new CreateEnrollmentResult.Success(body));
         }

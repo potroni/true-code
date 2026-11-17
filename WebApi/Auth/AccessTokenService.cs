@@ -4,6 +4,7 @@ using System.Security.Claims;
 using System.Text;
 using DataAccessLayer.Entities;
 using Microsoft.IdentityModel.Tokens;
+using WebApi.Contracts.Auth;
 
 namespace WebApi.Auth;
 

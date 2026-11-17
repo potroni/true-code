@@ -12,7 +12,9 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Attributes;
 using WebApi.Auth;
-using WebApi.Contracts;
+using WebApi.Contracts.Analytics;
+using WebApi.Contracts.Enrollments;
+using WebApi.Contracts.Schedule;
 using WebApi.Controllers;
 using WebApi.Middleware;
 
@@ -223,16 +225,16 @@ public class HttpContractTests
 public class HttpContractProbeController : BaseApiController
 {
     [HttpPost("class-seats")]
-    public IActionResult ClassSeats([FromRequiredBody] ClassSeatsRequest request) => Ok(request);
+    public IActionResult ClassSeats([FromRequiredBody] CreateEnrollmentRequest request) => Ok(request);
 
     [HttpPost("change-seats")]
-    public IActionResult ChangeSeats([FromRequiredBody] ChangeSeatsRequest request) => Ok(request);
+    public IActionResult ChangeSeats([FromRequiredBody] ChangeEnrollmentSeatsRequest request) => Ok(request);
 
     [HttpGet("schedule")]
     public IActionResult Schedule([FromQuery] ScheduleQuery query) => Ok(query);
 
     [HttpGet("load")]
-    public IActionResult Load([FromQuery] LoadQuery query) => Ok(query);
+    public IActionResult Load([FromQuery] RoomLoadQuery query) => Ok(query);
 
     [HttpGet("ids/{id}")]
     public IActionResult Id([FromRoute] long id) => Ok(id);

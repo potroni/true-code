@@ -6,7 +6,8 @@ using DataAccessLayer.Entities;
 using DataAccessLayer.UnitOfWork;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using WebApi.Contracts;
+using WebApi.Contracts.Enrollments;
+using WebApi.Contracts.Waitlist;
 using WebApi.Services;
 
 namespace WebApi.Tests;
@@ -47,7 +48,7 @@ public partial class EnrollmentHttpContractTests
         using var bookingRequest = CreateRequest($$"""{"classId":{{classId}},"seats":2}""", Guid.NewGuid().ToString("N"));
         using var bookingResponse = await ownerClient.SendAsync(bookingRequest);
         Assert.AreEqual(HttpStatusCode.Created, bookingResponse.StatusCode);
-        var booking = await bookingResponse.Content.ReadFromJsonAsync<EnrollmentResponse>();
+        var booking = await bookingResponse.Content.ReadFromJsonAsync<CreateEnrollmentResponse>();
         Assert.IsNotNull(booking);
         var firstKey = Guid.NewGuid().ToString("N");
         using var firstJoinRequest = CreateWaitlistJoin(classId, seats: 2, firstKey);

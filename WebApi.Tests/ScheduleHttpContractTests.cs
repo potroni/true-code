@@ -7,7 +7,8 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using WebApi.Auth;
-using WebApi.Contracts;
+using WebApi.Contracts.Schedule;
+using WebApi.Pagination;
 using WebApi.Services;
 
 namespace WebApi.Tests;
